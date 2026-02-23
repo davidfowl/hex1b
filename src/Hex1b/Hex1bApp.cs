@@ -91,6 +91,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     private int _dragStartX;
     private int _dragStartY;
     
+    // Drag-and-drop state for semantic drag operations (Draggable/Droppable widgets)
+    private readonly DragDropManager _dragDropManager = new();
+    
     // Render optimization - track if this is the first frame (needs full clear)
     private bool _isFirstFrame = true;
     
@@ -603,9 +606,22 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                         var deltaX = mouseEvent.X - _dragStartX;
                         var deltaY = mouseEvent.Y - _dragStartY;
                         _activeDragHandler.OnMove?.Invoke(dragContext, deltaX, deltaY);
+                        
+                        // Update drag-drop hover state for Draggable/Droppable widgets
+                        if (_dragDropManager.IsDragging)
+                        {
+                            UpdateDragDropHoverState(mouseEvent.X, mouseEvent.Y);
+                        }
                     }
                     else if (mouseEvent.Action == MouseAction.Up)
                     {
+                        // Complete drag-drop operation before clearing handler
+                        if (_dragDropManager.IsDragging && _activeDragNode is DraggableNode draggable)
+                        {
+                            await CompleteDragDropAsync(dragContext);
+                            draggable.IsDragging = false;
+                        }
+                        
                         _activeDragHandler.OnEnd?.Invoke(dragContext);
                         _activeDragHandler = null;
                         _activeDragNode = null;
@@ -715,6 +731,14 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
             long reconcileFrameStart = Stopwatch.GetTimestamp();
             
             _rootNode = await ReconcileAsync(_rootNode, widgetTree, cancellationToken);
+            
+            // Ensure the drag-drop manager is set on the root ZStack for overlay rendering.
+            // It's set after reconciliation here, but since ZStackNode persists across frames,
+            // it will be available for BuildOverlayWidget() on the NEXT reconciliation.
+            if (_rootNode is ZStackNode rootZStack)
+            {
+                rootZStack.DragDropManager = _dragDropManager;
+            }
             
             reconcileTicks = Stopwatch.GetTimestamp() - reconcileFrameStart;
             if (_diagnosticTimingEnabled) _diagReconcileTicks = reconcileTicks;
@@ -1068,9 +1092,12 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     /// <summary>
     /// Finds the deepest (topmost) node at the given position by traversing the tree.
     /// </summary>
-    private static Hex1bNode? FindNodeAt(Hex1bNode? node, int x, int y)
+    private static Hex1bNode? FindNodeAt(Hex1bNode? node, int x, int y, bool skipDragOverlay = false)
     {
         if (node == null) return null;
+        
+        // Skip drag overlay subtree so it doesn't intercept hit testing during drag
+        if (skipDragOverlay && node is DragOverlayNode) return null;
         
         // Check if point is within this node's bounds
         if (!node.Bounds.Contains(x, y)) return null;
@@ -1079,12 +1106,175 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         var children = node.GetChildren().ToList();
         for (int i = children.Count - 1; i >= 0; i--)
         {
-            var hit = FindNodeAt(children[i], x, y);
+            var hit = FindNodeAt(children[i], x, y, skipDragOverlay);
             if (hit != null) return hit;
         }
         
         // No child contains the point, return this node
         return node;
+    }
+
+    /// <summary>
+    /// Finds the nearest DroppableNode ancestor (or self) for the node at the given position.
+    /// Used during drag operations to determine the drop target.
+    /// Skips the drag overlay subtree so the ghost doesn't intercept drops.
+    /// </summary>
+    private DroppableNode? FindDroppableAt(int x, int y)
+    {
+        var node = FindNodeAt(_rootNode, x, y, skipDragOverlay: true);
+        while (node != null)
+        {
+            if (node is DroppableNode droppable)
+                return droppable;
+            node = node.Parent;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Updates the hover state on DroppableNodes during a drag operation.
+    /// Also updates proximity-based DropTarget activation.
+    /// </summary>
+    private void UpdateDragDropHoverState(int x, int y)
+    {
+        var droppable = FindDroppableAt(x, y);
+        var previousTarget = _dragDropManager.HoveredTarget;
+        
+        _dragDropManager.UpdatePosition(x, y, droppable);
+        
+        // Clear previous target's hover state
+        if (previousTarget != null && previousTarget != droppable)
+        {
+            previousTarget.IsHoveredByDrag = false;
+            previousTarget.CanAcceptDrag = false;
+            previousTarget.HoveredDragData = null;
+            
+            // Clear any active drop targets in the previous droppable
+            ClearDropTargets(previousTarget);
+        }
+        
+        // Set new target's hover state
+        if (droppable != null && _dragDropManager.ActiveDragData != null)
+        {
+            droppable.IsHoveredByDrag = true;
+            droppable.CanAcceptDrag = droppable.Accepts(_dragDropManager.ActiveDragData);
+            droppable.HoveredDragData = _dragDropManager.ActiveDragData;
+            
+            // Update drop target proximity
+            UpdateDropTargetProximity(droppable, y, _dragDropManager.ActiveDragData);
+        }
+        else
+        {
+            // No droppable — clear active drop target
+            if (_dragDropManager.ActiveDropTarget != null)
+            {
+                _dragDropManager.ActiveDropTarget.IsActive = false;
+                _dragDropManager.ActiveDropTarget.DragData = null;
+                _dragDropManager.ActiveDropTarget = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Finds the nearest DropTargetNode to the cursor within the given droppable and activates it.
+    /// </summary>
+    private void UpdateDropTargetProximity(DroppableNode droppable, int cursorY, object dragData)
+    {
+        var targets = droppable.FindDropTargets();
+        if (targets.Count == 0)
+        {
+            if (_dragDropManager.ActiveDropTarget != null)
+            {
+                _dragDropManager.ActiveDropTarget.IsActive = false;
+                _dragDropManager.ActiveDropTarget.DragData = null;
+                _dragDropManager.ActiveDropTarget = null;
+            }
+            return;
+        }
+
+        // Find nearest target by vertical distance to cursor
+        DropTargetNode? nearest = null;
+        int nearestDist = int.MaxValue;
+
+        foreach (var target in targets)
+        {
+            var centerY = target.Bounds.Y + target.Bounds.Height / 2;
+            var dist = Math.Abs(cursorY - centerY);
+            if (dist < nearestDist)
+            {
+                nearestDist = dist;
+                nearest = target;
+            }
+        }
+
+        // Deactivate previous if different
+        if (_dragDropManager.ActiveDropTarget != null && _dragDropManager.ActiveDropTarget != nearest)
+        {
+            _dragDropManager.ActiveDropTarget.IsActive = false;
+            _dragDropManager.ActiveDropTarget.DragData = null;
+        }
+
+        // Activate nearest
+        if (nearest != null)
+        {
+            nearest.IsActive = true;
+            nearest.DragData = dragData;
+            _dragDropManager.ActiveDropTarget = nearest;
+        }
+    }
+
+    /// <summary>
+    /// Clears all DropTargetNode activation state within a droppable.
+    /// </summary>
+    private void ClearDropTargets(DroppableNode droppable)
+    {
+        foreach (var target in droppable.FindDropTargets())
+        {
+            target.IsActive = false;
+            target.DragData = null;
+        }
+        if (_dragDropManager.ActiveDropTarget != null)
+        {
+            _dragDropManager.ActiveDropTarget = null;
+        }
+    }
+
+    /// <summary>
+    /// Completes a drag-drop operation by firing the drop handler on the hovered target (if valid).
+    /// </summary>
+    private async Task CompleteDragDropAsync(InputBindingActionContext context)
+    {
+        var target = _dragDropManager.HoveredTarget;
+        var dragData = _dragDropManager.ActiveDragData;
+        var source = _dragDropManager.ActiveSource;
+        var activeDropTarget = _dragDropManager.ActiveDropTarget;
+        
+        if (target != null && dragData != null && source != null && target.Accepts(dragData))
+        {
+            // If there's an active drop target, fire the drop target handler
+            if (activeDropTarget != null && target.DropTargetAction != null)
+            {
+                await target.DropTargetAction(context, activeDropTarget.TargetId, dragData, source);
+            }
+            else if (target.DropAction != null)
+            {
+                // Fall back to the general drop handler
+                var localX = _dragDropManager.DragX - target.Bounds.X;
+                var localY = _dragDropManager.DragY - target.Bounds.Y;
+                await target.DropAction(context, dragData, source, localX, localY);
+            }
+        }
+        
+        // Clear hover state on the target
+        if (target != null)
+        {
+            target.IsHoveredByDrag = false;
+            target.CanAcceptDrag = false;
+            target.HoveredDragData = null;
+            ClearDropTargets(target);
+        }
+        
+        _dragDropManager.EndDrag();
     }
 
     /// <summary>
@@ -1156,6 +1346,14 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                 _activeDragNode = hitNode;
                 _dragStartX = mouseEvent.X;
                 _dragStartY = mouseEvent.Y;
+                
+                // Start semantic drag-drop if this is a DraggableNode
+                if (hitNode is DraggableNode draggableNode)
+                {
+                    _dragDropManager.StartDrag(draggableNode, draggableNode.DragData, mouseEvent.X, mouseEvent.Y);
+                    draggableNode.IsDragging = true;
+                }
+                
                 return;
             }
         }
