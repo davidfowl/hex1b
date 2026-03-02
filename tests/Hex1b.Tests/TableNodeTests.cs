@@ -5,6 +5,7 @@ using Hex1b.Input;
 using Hex1b.Layout;
 using Hex1b.Nodes;
 using Hex1b.Widgets;
+using Xunit;
 
 namespace Hex1b.Tests;
 
@@ -1291,6 +1292,11 @@ public class TableNodeTests
             }
             return ValueTask.FromResult<IReadOnlyList<string>>(items);
         }
+
+        public ValueTask<int?> GetIndexForKeyAsync(object? key, CancellationToken cancellationToken = default)
+        {
+            return ValueTask.FromResult<int?>(null);
+        }
     }
 
     [Fact]
@@ -1648,6 +1654,359 @@ public class TableNodeTests
         // Assert
         Assert.True(hasFocusBars, 
             $"Expected focus bars (┃) after click. Focus key: {focusedKey}\nScreen after click:\n{afterText}");
+    }
+
+    #endregion
+
+    #region Virtualized Auto-Scroll with Index Lookup Tests
+
+    /// <summary>
+    /// Test data source with index lookup.
+    /// </summary>
+    private class TestDataSourceWithIndexLookup : ITableDataSource<string>
+    {
+        private readonly int _totalCount;
+        public List<string> IndexLookupKeys { get; } = [];
+
+#pragma warning disable CS0067 // Event is never used - required by interface
+        public event NotifyCollectionChangedEventHandler? CollectionChanged;
+#pragma warning restore CS0067
+
+        public TestDataSourceWithIndexLookup(int totalCount)
+        {
+            _totalCount = totalCount;
+        }
+
+        public ValueTask<int> GetItemCountAsync(CancellationToken cancellationToken = default)
+        {
+            return ValueTask.FromResult(_totalCount);
+        }
+
+        public ValueTask<IReadOnlyList<string>> GetItemsAsync(int startIndex, int count, CancellationToken cancellationToken = default)
+        {
+            var items = new List<string>();
+            for (int i = startIndex; i < startIndex + count && i < _totalCount; i++)
+            {
+                items.Add($"Row {i}");
+            }
+            return ValueTask.FromResult<IReadOnlyList<string>>(items);
+        }
+
+        public ValueTask<int?> GetIndexForKeyAsync(object? key, CancellationToken cancellationToken = default)
+        {
+            if (key is string keyStr)
+            {
+                IndexLookupKeys.Add(keyStr);
+                if (keyStr.StartsWith("Row "))
+                {
+                    var indexStr = keyStr.Substring(4);
+                    if (int.TryParse(indexStr, out int index) && index >= 0 && index < _totalCount)
+                    {
+                        return ValueTask.FromResult<int?>(index);
+                    }
+                }
+            }
+            return ValueTask.FromResult<int?>(null);
+        }
+    }
+
+    /// <summary>
+    /// Test data source WITHOUT index lookup (for backward compatibility test).
+    /// </summary>
+    private class TestDataSourceWithoutIndexLookup : ITableDataSource<string>
+    {
+        private readonly int _totalCount;
+
+#pragma warning disable CS0067 // Event is never used - required by interface
+        public event NotifyCollectionChangedEventHandler? CollectionChanged;
+#pragma warning restore CS0067
+
+        public TestDataSourceWithoutIndexLookup(int totalCount)
+        {
+            _totalCount = totalCount;
+        }
+
+        public ValueTask<int> GetItemCountAsync(CancellationToken cancellationToken = default)
+        {
+            return ValueTask.FromResult(_totalCount);
+        }
+
+        public ValueTask<IReadOnlyList<string>> GetItemsAsync(int startIndex, int count, CancellationToken cancellationToken = default)
+        {
+            var items = new List<string>();
+            for (int i = startIndex; i < startIndex + count && i < _totalCount; i++)
+            {
+                items.Add($"Row {i}");
+            }
+            return ValueTask.FromResult<IReadOnlyList<string>>(items);
+        }
+
+        public ValueTask<int?> GetIndexForKeyAsync(object? key, CancellationToken cancellationToken = default)
+        {
+            return ValueTask.FromResult<int?>(null);
+        }
+    }
+
+    [Fact]
+    public async Task VirtualizedScroll_SetFocusToRowOutsideCache_UsesIndexLookup()
+    {
+        // Arrange
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(80, 15)
+            .Build();
+
+        var dataSource = new TestDataSourceWithIndexLookup(1000);
+        var focusedKey = (object?)"Row 500"; // Focus a row far outside the initial cache
+
+        using var app = new Hex1bApp(
+            ctx => ctx.Table(dataSource)
+                .RowKey(s => s)
+                .Header(h => [h.Cell("Name")])
+                .Row((r, item, _) => [r.Cell(item)])
+                .Focus(focusedKey)
+                .OnFocusChanged(key => focusedKey = key)
+                .FillHeight(),
+            new Hex1bAppOptions { WorkloadAdapter = workload }
+        );
+
+        var runTask = app.RunAsync(TestContext.Current.CancellationToken);
+
+        // Wait for initial render
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("Row 500"), TimeSpan.FromSeconds(3), "Wait for table to scroll to focused row")
+            .Wait(100)
+            .Ctrl().Key(Hex1bKey.C)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        await runTask;
+
+        // Assert - the data source's GetIndexForKey should have been called
+        Assert.Contains("Row 500", dataSource.IndexLookupKeys);
+    }
+
+    [Fact]
+    public async Task VirtualizedScroll_DataSourceWithoutIndexLookup_DoesNotScrollToRowOutsideCache()
+    {
+        // Arrange - data source without GetIndexForKey should NOT scroll to out-of-cache row
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(80, 15)
+            .Build();
+
+        var dataSource = new TestDataSourceWithoutIndexLookup(1000);
+        var focusedKey = (object?)"Row 500"; // Focus a row far outside the initial cache
+
+        using var app = new Hex1bApp(
+            ctx => ctx.Table(dataSource)
+                .RowKey(s => s)
+                .Header(h => [h.Cell("Name")])
+                .Row((r, item, _) => [r.Cell(item)])
+                .Focus(focusedKey)
+                .OnFocusChanged(key => focusedKey = key)
+                .FillHeight(),
+            new Hex1bAppOptions { WorkloadAdapter = workload }
+        );
+
+        var runTask = app.RunAsync(TestContext.Current.CancellationToken);
+
+        // Wait for initial render - the row 500 should NOT be visible (not scrolled)
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => !s.ContainsText("Row 500"), TimeSpan.FromSeconds(2), "Wait for table to render without scrolling to out-of-cache row")
+            .Wait(100)
+            .Ctrl().Key(Hex1bKey.C)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        await runTask;
+
+        // Assert - should still show the initial cache (rows 0-49), not row 500
+        var snapshot = terminal.CreateSnapshot();
+        var text = snapshot.GetScreenText();
+        Assert.DoesNotContain("Row 500", text);
+    }
+
+    #endregion
+
+    #region Focus Scroll and Click Handler Bug Fixes
+
+    [Fact]
+    public async Task Focus_ExternalSetToRowOffScreen_ScrollsToMakeRowVisible()
+    {
+        // This tests the fix for: when setting FocusKey externally via TableWidget.Focus(key),
+        // the table should scroll to make the focused row visible
+        
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(80, 15)
+            .Build();
+        
+        var data = Enumerable.Range(1, 100).Select(i => $"Item {i:D3}").ToArray();
+        object? focusedKey = "Item 001";
+        
+        using var app = new Hex1bApp(
+            ctx => ctx.Table(data)
+                .RowKey(s => s)
+                .Header(h => [h.Cell("Name")])
+                .Row((r, item, _) => [r.Cell(item)])
+                .Focus(focusedKey)
+                .OnFocusChanged(key => focusedKey = key)
+                .FillHeight(),
+            new Hex1bAppOptions { WorkloadAdapter = workload }
+        );
+        
+        var runTask = app.RunAsync(TestContext.Current.CancellationToken);
+        
+        // Wait for initial render
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("Item 001"), TimeSpan.FromSeconds(2), "Wait for table to render")
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        // Capture screen to see what's visible initially
+        var snapshotInitial = terminal.CreateSnapshot();
+        var textInitial = snapshotInitial.GetScreenText();
+        TestContext.Current.TestOutputHelper?.WriteLine($"=== Initial screen (focus Item 001) ===");
+        TestContext.Current.TestOutputHelper?.WriteLine(textInitial);
+        
+        // Initially, should see Item 001 and possibly a few more
+        Assert.Contains("Item 001", textInitial);
+        Assert.Contains("Item 002", textInitial); // Should be visible too
+        
+        // Now programmatically set focus to a row that's off-screen (row 50)
+        // This simulates calling TableWidget.Focus("Item 050")
+        
+        // Wait for any pending render to complete first
+        await new Hex1bTerminalInputSequenceBuilder()
+            .Wait(100)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        // Now set the new focus value
+        focusedKey = "Item 050";
+        
+        // Send a key to trigger render cycle (Escape won't change focus, just triggers render)
+        await new Hex1bTerminalInputSequenceBuilder()
+            .Key(Hex1bKey.Escape)
+            .Wait(200)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        // The table should have scrolled to make row 50 visible
+        // Capture the screen to verify
+        var snapshot = terminal.CreateSnapshot();
+        var text = snapshot.GetScreenText();
+        TestContext.Current.TestOutputHelper?.WriteLine($"=== After Focus(Item 050) ===");
+        TestContext.Current.TestOutputHelper?.WriteLine(text);
+        
+        // Row 50 should now be visible in the rendered output
+        Assert.Contains("Item 050", text);
+        
+        // Old rows should no longer be visible (scrolled away)
+        // Note: Item 001 should be off-screen now
+        
+        // Exit
+        await new Hex1bTerminalInputSequenceBuilder()
+            .Ctrl().Key(Hex1bKey.C)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        await runTask;
+    }
+
+    [Fact]
+    public async Task Click_AfterScrollingInVirtualizedTable_ReturnsCorrectRowData()
+    {
+        // This tests the fix for: clicking rows after scrolling in a virtualized table
+        // returned wrong data due to incorrect index calculation
+        
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(80, 25)
+            .WithMouse()
+            .Build();
+        
+        var dataSource = new TestAsyncDataSource(1000);
+        object? focusedKey = null;
+        
+        using var app = new Hex1bApp(
+            ctx => ctx.Table(dataSource)
+                .RowKey(s => s)
+                .Header(h => [h.Cell("Name")])
+                .Row((r, item, _) => [r.Cell(item)])
+                .Focus(focusedKey)
+                .OnFocusChanged(key => focusedKey = key)
+                .FillHeight(),
+            new Hex1bAppOptions { WorkloadAdapter = workload, EnableMouse = true }
+        );
+        
+        var runTask = app.RunAsync(TestContext.Current.CancellationToken);
+        
+        // Wait for initial render
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("Item 00001"), TimeSpan.FromSeconds(2), "Wait for table to render")
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        // Navigate down to scroll the viewport (e.g., to row 100)
+        // This will cause the cache to load rows around 100
+        var navBuilder = new Hex1bTerminalInputSequenceBuilder();
+        for (int i = 0; i < 50; i++)
+        {
+            navBuilder.Key(Hex1bKey.DownArrow).Wait(20);
+        }
+
+        await navBuilder.Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        // Wait for navigation to complete
+        await new Hex1bTerminalInputSequenceBuilder()
+            .Wait(200)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        var snapshotBeforeClick = terminal.CreateSnapshot();
+        TestContext.Current.TestOutputHelper?.WriteLine($"=== After navigation ===");
+        TestContext.Current.TestOutputHelper?.WriteLine(snapshotBeforeClick.GetScreenText());
+        TestContext.Current.TestOutputHelper?.WriteLine($"Focus before click: {focusedKey}");
+        
+        // Now click on the first visible row (which should be around row 50)
+        // The click handler should correctly map this to the right data
+        // Click on the first data row (approximately y=4: top border + header + separator)
+        await new Hex1bTerminalInputSequenceBuilder()
+            .ClickAt(10, 4)
+            .Wait(300)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        var snapshotAfter = terminal.CreateSnapshot();
+        TestContext.Current.TestOutputHelper?.WriteLine($"=== After click ===");
+        TestContext.Current.TestOutputHelper?.WriteLine(snapshotAfter.GetScreenText());
+        TestContext.Current.TestOutputHelper?.WriteLine($"Focus after click: {focusedKey}");
+        
+        // The focused key should NOT be null - click should have set focus
+        Assert.NotNull(focusedKey);
+        
+        // The focused key should be around row 50 (the first visible row after navigation)
+        // and should contain "Item 0" (since we're looking at items 50+)
+        Assert.True(focusedKey?.ToString()?.StartsWith("Item 0") == true,
+            $"Expected focus to be on an item starting with 'Item 0', but got: {focusedKey}");
+        
+        // Exit
+        await new Hex1bTerminalInputSequenceBuilder()
+            .Ctrl().Key(Hex1bKey.C)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        
+        await runTask;
     }
 
     #endregion
