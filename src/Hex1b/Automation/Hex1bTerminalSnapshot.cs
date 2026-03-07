@@ -33,6 +33,21 @@ public sealed class Hex1bTerminalSnapshot : IHex1bTerminalRegion, IDisposable
         CellPixelWidth = terminal.Capabilities.CellPixelWidth;
         CellPixelHeight = terminal.Capabilities.CellPixelHeight;
 
+        // Capture KGP placements and their image data
+        var placements = terminal.KgpPlacements;
+        KgpPlacements = placements;
+        var images = new Dictionary<uint, KgpImageData>();
+        foreach (var placement in placements)
+        {
+            if (!images.ContainsKey(placement.ImageId))
+            {
+                var imageData = terminal.KgpImageStore.GetImageById(placement.ImageId);
+                if (imageData is not null)
+                    images[placement.ImageId] = imageData;
+            }
+        }
+        KgpImages = images;
+
         // Get scrollback rows if requested
         ScrollbackRow[] scrollbackRows = [];
         if (scrollbackLines > 0 && terminal.Scrollback is { } scrollback)
@@ -147,6 +162,16 @@ public sealed class Hex1bTerminalSnapshot : IHex1bTerminalRegion, IDisposable
     /// Height of a terminal character cell in pixels.
     /// </summary>
     public int CellPixelHeight { get; }
+
+    /// <summary>
+    /// KGP image placements active at snapshot time.
+    /// </summary>
+    public IReadOnlyList<KgpPlacement> KgpPlacements { get; }
+
+    /// <summary>
+    /// KGP image data referenced by placements, keyed by image ID.
+    /// </summary>
+    public IReadOnlyDictionary<uint, KgpImageData> KgpImages { get; }
 
     /// <inheritdoc />
     public TerminalCell GetCell(int x, int y)
