@@ -1,6 +1,8 @@
 using Hex1b.Documents;
 using Hex1b.Input;
 using Hex1b.Layout;
+using Hex1b.LanguageServer;
+using Hex1b.LanguageServer.Protocol;
 using Hex1b.Theming;
 using Hex1b.Widgets;
 
@@ -12,7 +14,7 @@ namespace Hex1b;
 /// Scrollbars are rendered and handled internally (not composed) because their
 /// behavior is tightly coupled to the active IEditorViewRenderer.
 /// </summary>
-public sealed class EditorNode : Hex1bNode
+public sealed class EditorNode : Hex1bNode, IEditorSession
 {
     private int _scrollOffset; // First visible line (1-based)
     private int _horizontalScrollOffset; // First visible column (0-based)
@@ -23,13 +25,33 @@ public sealed class EditorNode : Hex1bNode
     private bool _cursorDirty; // Set when cursor changes; cleared after Arrange adjusts scroll
     private char? _pendingNibble; // For hex renderers: first nibble of partially-entered byte
     private IHex1bDocument? _subscribedDocument;
+    private readonly List<EditorOverlay> _activeOverlays = [];
+    private IReadOnlyList<InlineHint> _activeInlineHints = [];
+    private IReadOnlyList<RangeHighlight> _activeRangeHighlights = [];
+    private readonly RangeHighlightDecorationProvider _rangeHighlightProvider = new();
+    private IReadOnlyList<GutterDecoration> _activeGutterDecorations = [];
+    private readonly DecorationGutterProvider _decorationGutterProvider = new();
+    private IReadOnlyList<FoldingRegion> _foldingRegions = [];
+    private readonly FoldingGutterProvider _foldingGutterProvider = new();
+    private int _cachedDocMaxWidth; // Cached max line width across entire document
+    private long _cachedDocMaxWidthVersion = -1; // Document version when cache was computed
+    private BreadcrumbData? _breadcrumbs;
+    private SignaturePanel? _signaturePanel;
+    private Hex1bRenderContext? _lastRenderContext; // For IEditorSession.Capabilities
+    private CompletionController? _completionController;
+    private string _completionFilterPrefix = "";
 
     /// <summary>
     /// Marks that the cursor has changed and scroll should adjust to keep it visible
     /// on the next Arrange pass. Called automatically by input handlers; exposed for
     /// testing scenarios that modify EditorState directly.
     /// </summary>
-    internal void NotifyCursorChanged() => _cursorDirty = true;
+    internal void NotifyCursorChanged()
+    {
+        _cursorDirty = true;
+        // Dismiss overlays that should close on cursor move
+        _activeOverlays.RemoveAll(o => o.DismissOnCursorMove);
+    }
 
     /// <summary>The source widget that was reconciled into this node.</summary>
     public EditorWidget? SourceWidget { get; set; }
@@ -39,6 +61,87 @@ public sealed class EditorNode : Hex1bNode
 
     /// <summary>The view renderer that controls how document content is displayed.</summary>
     public IEditorViewRenderer ViewRenderer { get; set; } = TextEditorViewRenderer.Instance;
+
+    /// <summary>Text decoration providers for syntax highlighting, diagnostics, etc.</summary>
+    public IReadOnlyList<ITextDecorationProvider>? DecorationProviders { get; internal set; }
+
+    /// <summary>
+    /// Updates the decoration providers, activating new ones and deactivating removed ones.
+    /// </summary>
+    internal void UpdateDecorationProviders(IReadOnlyList<ITextDecorationProvider>? newProviders)
+    {
+        var oldProviders = DecorationProviders;
+
+        // Deactivate providers that are no longer present
+        if (oldProviders != null)
+        {
+            foreach (var old in oldProviders)
+            {
+                if (newProviders == null || !newProviders.Contains(old))
+                    old.Deactivate();
+            }
+        }
+
+        // Activate providers that are newly added
+        if (newProviders != null)
+        {
+            foreach (var p in newProviders)
+            {
+                if (oldProviders == null || !oldProviders.Contains(p))
+                    p.Activate(this);
+            }
+        }
+
+        DecorationProviders = newProviders;
+    }
+
+    /// <summary>Whether to show line numbers in a gutter on the left side.</summary>
+    public bool ShowLineNumbers { get; set; }
+
+    /// <summary>Whether soft line wrapping is enabled.</summary>
+    public bool WordWrap { get; set; }
+
+    /// <summary>
+    /// Gutter providers rendered left-to-right in the editor's left margin.
+    /// When empty and <see cref="ShowLineNumbers"/> is true, a default
+    /// <see cref="LineNumberGutterProvider"/> is used.
+    /// </summary>
+    internal List<IGutterProvider> GutterProviders { get; set; } = [];
+
+    /// <summary>
+    /// Returns the effective list of gutter providers, including the implicit
+    /// line number provider when <see cref="ShowLineNumbers"/> is true.
+    /// </summary>
+    private IReadOnlyList<IGutterProvider> EffectiveGutterProviders
+    {
+        get
+        {
+            var hasDecorations = _activeGutterDecorations.Count > 0;
+            var hasFolding = _foldingRegions.Count > 0;
+            var providers = new List<IGutterProvider>();
+
+            if (hasDecorations)
+                providers.Add(_decorationGutterProvider);
+
+            if (hasFolding)
+                providers.Add(_foldingGutterProvider);
+
+            if (GutterProviders.Count > 0)
+            {
+                foreach (var p in GutterProviders)
+                {
+                    if (p != _decorationGutterProvider && p != _foldingGutterProvider)
+                        providers.Add(p);
+                }
+            }
+            else if (ShowLineNumbers)
+            {
+                providers.Add(LineNumberGutterProvider.Instance);
+            }
+
+            return providers;
+        }
+    }
 
     /// <summary>
     /// Internal action invoked when text content changes.
@@ -51,7 +154,10 @@ public sealed class EditorNode : Hex1bNode
         get => _scrollOffset;
         internal set
         {
-            var maxLine = State != null ? ViewRenderer.GetTotalLines(State.Document, Bounds.Width) : 1;
+            var maxLine = State != null
+                ? TextEditorViewRenderer.GetVisualLineCount(
+                    ViewRenderer.GetTotalLines(State.Document, Bounds.Width), _foldingRegions)
+                : 1;
             var clamped = Math.Clamp(value, 1, Math.Max(1, maxLine));
             if (_scrollOffset != clamped)
             {
@@ -143,6 +249,18 @@ public sealed class EditorNode : Hex1bNode
 
         // ── Escape to collapse multi-cursor ─────────────────────
         // Note: Escape is only handled when we have multiple cursors
+        bindings.Key(Hex1bKey.Escape).Action(HandleEscape, "Escape");
+
+        // ── Completion trigger ──────────────────────────────────
+        bindings.Ctrl().Key(Hex1bKey.Spacebar).Action(TriggerCompletionAsync, "Trigger completion");
+
+        // ── LSP feature triggers ────────────────────────────────
+        bindings.Ctrl().Key(Hex1bKey.K).Action(TriggerHoverAsync, "Show hover info");
+        bindings.Key(Hex1bKey.F12).Action(TriggerDefinitionAsync, "Go to definition");
+        bindings.Shift().Key(Hex1bKey.F12).Action(TriggerReferencesAsync, "Find references");
+
+        // ── Folding ────────────────────────────────────────────
+        bindings.Key(Hex1bKey.F4).Triggers(EditorWidget.ToggleFold, ToggleFoldAtCursor, "Toggle fold");
 
         // ── Editing ─────────────────────────────────────────────
         bindings.Key(Hex1bKey.Backspace).Triggers(EditorWidget.DeleteBackward, DeleteBackwardAsync, "Delete backward");
@@ -205,23 +323,48 @@ public sealed class EditorNode : Hex1bNode
 
         // Determine scrollbar visibility first (before computing content area)
         var totalLines = State != null ? ViewRenderer.GetTotalLines(State.Document, Bounds.Width) : 0;
-        var maxLineWidth = State != null
-            ? ViewRenderer.GetMaxLineWidth(State.Document, _scrollOffset, bounds.Height, bounds.Width)
-            : 0;
+        var visualTotalLines = TextEditorViewRenderer.GetVisualLineCount(totalLines, _foldingRegions);
 
-        _showVerticalScrollbar = totalLines > bounds.Height && bounds.Width > 1;
-        _showHorizontalScrollbar = maxLineWidth > bounds.Width - (_showVerticalScrollbar ? 1 : 0)
+        // Use cached document-wide max line width for scrollbar visibility.
+        // Only recompute when the document version changes.
+        var docMaxWidth = GetDocumentMaxLineWidth();
+
+        _showVerticalScrollbar = visualTotalLines > bounds.Height && bounds.Width > 1;
+        _showHorizontalScrollbar = !WordWrap
+            && docMaxWidth > bounds.Width - (_showVerticalScrollbar ? 1 : 0) - GetGutterWidth()
             && bounds.Height > 1;
 
-        // Content area excludes scrollbar space
+        // Content area excludes scrollbar space and line number gutter
         _viewportLines = bounds.Height - (_showHorizontalScrollbar ? 1 : 0);
-        _viewportColumns = bounds.Width - (_showVerticalScrollbar ? 1 : 0);
+        _viewportColumns = bounds.Width - (_showVerticalScrollbar ? 1 : 0) - GetGutterWidth();
 
         // Re-check vertical after adjusting for horizontal scrollbar
-        if (!_showVerticalScrollbar && totalLines > _viewportLines && _viewportColumns > 0)
+        if (!_showVerticalScrollbar && visualTotalLines > _viewportLines && _viewportColumns > 0)
         {
             _showVerticalScrollbar = true;
-            _viewportColumns = bounds.Width - 1;
+            _viewportColumns = bounds.Width - 1 - GetGutterWidth();
+        }
+
+        // Clamp horizontal scroll offset to valid range after viewport change.
+        // Folding or vertical scrollbar toggling can change _viewportColumns, making
+        // a previously valid offset exceed the new maximum.
+        if (_showHorizontalScrollbar && _viewportColumns > 0)
+        {
+            var maxHScroll = Math.Max(0, GetDocumentMaxLineWidth() - _viewportColumns);
+            if (_horizontalScrollOffset > maxHScroll)
+                _horizontalScrollOffset = maxHScroll;
+        }
+        else if (!_showHorizontalScrollbar)
+        {
+            _horizontalScrollOffset = 0;
+        }
+
+        // Clamp vertical scroll offset after folding may have reduced visual line count
+        if (visualTotalLines > 0)
+        {
+            var maxVScroll = Math.Max(1, visualTotalLines - _viewportLines + 1);
+            if (_scrollOffset > maxVScroll)
+                _scrollOffset = maxVScroll;
         }
 
         // Subscribe to document changes if not already
@@ -241,8 +384,56 @@ public sealed class EditorNode : Hex1bNode
     {
         if (State == null) return;
 
-        // Render text content at full bounds width — scrollbars render on top
-        ViewRenderer.Render(context, State, Bounds, _scrollOffset, _horizontalScrollOffset, IsFocused, _pendingNibble);
+        var contentBounds = Bounds;
+        var contentHeight = _viewportLines;
+
+        var gutterProviders = EffectiveGutterProviders;
+        if (gutterProviders.Count > 0)
+        {
+            var gutterWidth = GetGutterWidth();
+            var theme = context.Theme;
+            var totalLines = State.Document.LineCount;
+
+            for (var viewLine = 0; viewLine < contentHeight; viewLine++)
+            {
+                var docLine = TextEditorViewRenderer.MapViewLineToDocLine(
+                    _scrollOffset + viewLine, _foldingRegions);
+                var screenY = Bounds.Y + viewLine;
+                var effectiveDocLine = docLine <= totalLines ? docLine : 0;
+
+                var providerX = Bounds.X;
+                foreach (var provider in gutterProviders)
+                {
+                    var pw = provider.GetWidth(State.Document);
+                    provider.RenderLine(context, theme, providerX, screenY, effectiveDocLine, pw);
+                    providerX += pw;
+                }
+            }
+
+            contentBounds = new Rect(Bounds.X + gutterWidth, Bounds.Y,
+                Math.Max(1, Bounds.Width - gutterWidth), contentHeight);
+        }
+        else
+        {
+            contentBounds = new Rect(Bounds.X, Bounds.Y, Bounds.Width, contentHeight);
+        }
+
+        // Build effective decoration providers (include range highlight provider if active)
+        var effectiveProviders = DecorationProviders;
+        if (_activeRangeHighlights.Count > 0)
+        {
+            _rangeHighlightProvider.SetHighlights(_activeRangeHighlights, context.Theme);
+            effectiveProviders = effectiveProviders != null
+                ? [_rangeHighlightProvider, ..effectiveProviders]
+                : [_rangeHighlightProvider];
+        }
+        else
+        {
+            _rangeHighlightProvider.Clear();
+        }
+
+        // Render text content
+        ViewRenderer.Render(context, State, contentBounds, _scrollOffset, _horizontalScrollOffset, IsFocused, _pendingNibble, effectiveProviders, _activeInlineHints, WordWrap, _foldingRegions);
 
         // Render scrollbars (self-rendered, not composed)
         if (_showVerticalScrollbar)
@@ -257,19 +448,476 @@ public sealed class EditorNode : Hex1bNode
             context.WriteClipped(Bounds.X + Bounds.Width - 1, Bounds.Y + Bounds.Height - 1,
                 $"{bg.ToBackgroundAnsi()} ");
         }
+
+        // Render overlays on top of content
+        if (_activeOverlays.Count > 0)
+            RenderOverlays(context, contentBounds);
+
+        _lastRenderContext = context;
+    }
+
+    // ── Overlay rendering ─────────────────────────────────────
+
+    private void RenderOverlays(Hex1bRenderContext context, Rect contentBounds)
+    {
+        foreach (var overlay in _activeOverlays)
+        {
+            var screenPos = DocumentToScreen(overlay.AnchorPosition, contentBounds);
+            if (screenPos is null) continue;
+
+            var (anchorX, anchorY) = screenPos.Value;
+            var contentLines = overlay.Content;
+            if (contentLines.Count == 0) continue;
+
+            // Apply MaxHeight constraint
+            var maxH = overlay.MaxHeight ?? int.MaxValue;
+            var visibleContent = contentLines.Count > maxH
+                ? contentLines.Take(maxH).ToList()
+                : contentLines;
+
+            // Calculate overlay dimensions
+            var maxWidth = 0;
+            foreach (var line in visibleContent)
+            {
+                if (line.Segments is { } segments)
+                {
+                    var segWidth = 0;
+                    foreach (var seg in segments)
+                        segWidth += seg.Text.Length;
+                    maxWidth = Math.Max(maxWidth, segWidth);
+                }
+                else
+                {
+                    maxWidth = Math.Max(maxWidth, line.Text.Length);
+                }
+            }
+
+            // Apply MaxWidth constraint, then cap at bounds
+            var maxW = overlay.MaxWidth ?? int.MaxValue;
+            maxWidth = Math.Min(maxWidth, maxW);
+            maxWidth = Math.Min(maxWidth + 2, contentBounds.Width); // +2 for border padding
+
+            // Ensure title fits if present
+            if (overlay.Title is { } title)
+                maxWidth = Math.Max(maxWidth, Math.Min(title.Length + 4, contentBounds.Width)); // +4 for border chars and spacing
+
+            var overlayHeight = visibleContent.Count + 2; // +2 for top/bottom border
+
+            // Position based on placement
+            int overlayX = Math.Max(contentBounds.X, Math.Min(anchorX, contentBounds.Right - maxWidth));
+            int overlayY;
+
+            if (overlay.Placement == OverlayPlacement.Above)
+            {
+                overlayY = anchorY - overlayHeight;
+                if (overlayY < contentBounds.Y)
+                    overlayY = anchorY + 1; // Fall back to below
+            }
+            else
+            {
+                overlayY = anchorY + 1;
+                if (overlayY + overlayHeight > contentBounds.Bottom)
+                    overlayY = anchorY - overlayHeight; // Fall back to above
+            }
+
+            // Clamp to screen
+            overlayY = Math.Max(contentBounds.Y, overlayY);
+
+            // Resolve theme colors
+            var borderFg = context.Theme.Get(OverlayTheme.BorderColor);
+            var overlayBg = context.Theme.Get(OverlayTheme.BackgroundColor);
+            var defaultFg = context.Theme.Get(OverlayTheme.ForegroundColor);
+            var resetAnsi = "\x1b[0m";
+            var innerWidth = maxWidth - 2;
+
+            // Top border (with optional title)
+            string topBorder;
+            if (overlay.Title is { } overlayTitle && overlayTitle.Length > 0)
+            {
+                var titleFg = context.Theme.Get(OverlayTheme.TitleForegroundColor);
+                var availableForTitle = innerWidth - 2; // space on each side of title
+                var displayTitle = overlayTitle.Length > availableForTitle
+                    ? overlayTitle[..availableForTitle]
+                    : overlayTitle;
+                var rightDashes = innerWidth - displayTitle.Length - 2; // 1 dash left + 1 space each side
+                topBorder = $"┌─{titleFg.ToForegroundAnsi()}{displayTitle}{borderFg.ToForegroundAnsi()}" +
+                            $"{new string('─', Math.Max(0, rightDashes))}┐";
+            }
+            else
+            {
+                topBorder = "┌" + new string('─', innerWidth) + "┐";
+            }
+
+            context.WriteClipped(overlayX, overlayY,
+                $"{borderFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}{topBorder}{resetAnsi}");
+
+            // Content lines
+            for (var i = 0; i < visibleContent.Count && overlayY + 1 + i < contentBounds.Bottom; i++)
+            {
+                var line = visibleContent[i];
+
+                if (line.Segments is { } lineSegments)
+                {
+                    // Rich segment rendering
+                    var segmentContent = "";
+                    var totalLen = 0;
+                    foreach (var segment in lineSegments)
+                    {
+                        var remaining = innerWidth - totalLen;
+                        if (remaining <= 0) break;
+                        var segText = segment.Text.Length > remaining
+                            ? segment.Text[..remaining]
+                            : segment.Text;
+                        var segFg = segment.Foreground ?? defaultFg;
+                        segmentContent += segFg.ToForegroundAnsi();
+                        if (segment.Background is { } segBg)
+                            segmentContent += segBg.ToBackgroundAnsi();
+                        else
+                            segmentContent += overlayBg.ToBackgroundAnsi();
+                        if (segment.IsBold) segmentContent += "\x1b[1m";
+                        if (segment.IsItalic) segmentContent += "\x1b[3m";
+                        segmentContent += segText;
+                        if (segment.IsBold || segment.IsItalic) segmentContent += "\x1b[22;23m";
+                        totalLen += segText.Length;
+                    }
+
+                    // Pad remaining space
+                    var padding = innerWidth - totalLen;
+                    if (padding > 0)
+                        segmentContent += $"{defaultFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}{new string(' ', padding)}";
+
+                    context.WriteClipped(overlayX, overlayY + 1 + i,
+                        $"{borderFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}│" +
+                        $"{segmentContent}" +
+                        $"{borderFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}│{resetAnsi}");
+                }
+                else
+                {
+                    // Simple text rendering
+                    var lineFg = line.Foreground ?? defaultFg;
+                    var lineBg = line.Background ?? overlayBg;
+                    var paddedText = line.Text.PadRight(innerWidth)[..innerWidth];
+
+                    context.WriteClipped(overlayX, overlayY + 1 + i,
+                        $"{borderFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}│" +
+                        $"{lineFg.ToForegroundAnsi()}{lineBg.ToBackgroundAnsi()}{paddedText}" +
+                        $"{borderFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}│{resetAnsi}");
+                }
+            }
+
+            // Bottom border
+            var bottomY = overlayY + 1 + visibleContent.Count;
+            if (bottomY < contentBounds.Bottom)
+            {
+                var bottomBorder = "└" + new string('─', innerWidth) + "┘";
+                context.WriteClipped(overlayX, bottomY,
+                    $"{borderFg.ToForegroundAnsi()}{overlayBg.ToBackgroundAnsi()}{bottomBorder}{resetAnsi}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Maps a document position to screen coordinates relative to the current viewport.
+    /// Returns null if the position is outside the visible area.
+    /// </summary>
+    private (int X, int Y)? DocumentToScreen(DocumentPosition docPos, Rect contentBounds)
+    {
+        // Check if the line is visible
+        var viewLine = docPos.Line - _scrollOffset;
+        if (viewLine < 0 || viewLine >= _viewportLines)
+            return null;
+
+        // Calculate screen column (accounting for horizontal scroll)
+        var screenCol = docPos.Column - 1 - _horizontalScrollOffset;
+        if (screenCol < 0)
+            screenCol = 0;
+
+        return (contentBounds.X + screenCol, contentBounds.Y + viewLine);
+    }
+
+    // ── IEditorSession implementation ─────────────────────────
+
+    EditorState IEditorSession.State => State;
+
+    TerminalCapabilities IEditorSession.Capabilities =>
+        _lastRenderContext?.Capabilities ?? TerminalCapabilities.Modern;
+
+    void IEditorSession.Invalidate()
+    {
+        MarkDirty();
+        AppInvalidate?.Invoke();
+    }
+
+    void IEditorSession.PushOverlay(EditorOverlay overlay)
+    {
+        // Replace if same ID exists
+        _activeOverlays.RemoveAll(o => o.Id == overlay.Id);
+        _activeOverlays.Add(overlay);
+    }
+
+    void IEditorSession.DismissOverlay(string overlayId)
+    {
+        _activeOverlays.RemoveAll(o => o.Id == overlayId);
+    }
+
+    IReadOnlyList<EditorOverlay> IEditorSession.ActiveOverlays => _activeOverlays;
+
+    void IEditorSession.PushInlineHints(IReadOnlyList<InlineHint> hints)
+    {
+        _activeInlineHints = hints;
+    }
+
+    void IEditorSession.ClearInlineHints()
+    {
+        _activeInlineHints = [];
+    }
+
+    IReadOnlyList<InlineHint> IEditorSession.ActiveInlineHints => _activeInlineHints;
+
+    void IEditorSession.PushRangeHighlights(IReadOnlyList<RangeHighlight> highlights)
+    {
+        _activeRangeHighlights = highlights;
+    }
+
+    void IEditorSession.ClearRangeHighlights()
+    {
+        _activeRangeHighlights = [];
+    }
+
+    IReadOnlyList<RangeHighlight> IEditorSession.ActiveRangeHighlights => _activeRangeHighlights;
+
+    void IEditorSession.PushGutterDecorations(IReadOnlyList<GutterDecoration> decorations)
+    {
+        _activeGutterDecorations = decorations;
+        _decorationGutterProvider.SetDecorations(decorations);
+    }
+
+    void IEditorSession.ClearGutterDecorations()
+    {
+        _activeGutterDecorations = [];
+        _decorationGutterProvider.Clear();
+    }
+
+    IReadOnlyList<GutterDecoration> IEditorSession.ActiveGutterDecorations => _activeGutterDecorations;
+
+    // ── Folding regions ────────────────────────────────────────
+
+    void IEditorSession.SetFoldingRegions(IReadOnlyList<FoldingRegion> regions)
+    {
+        _foldingRegions = regions;
+        _foldingGutterProvider.SetRegions(regions, ToggleFoldingRegion);
+    }
+
+    IReadOnlyList<FoldingRegion> IEditorSession.FoldingRegions => _foldingRegions;
+
+    private void ToggleFoldAtCursor()
+    {
+        if (_foldingRegions.Count == 0 || State == null) return;
+        var offset = Math.Min(State.Cursor.Position.Value, State.Document.Length);
+        var cursorPos = State.Document.OffsetToPosition(new DocumentOffset(offset));
+        var cursorLine = cursorPos.Line;
+
+        // Find the innermost region that contains or starts at the cursor line
+        var bestIndex = -1;
+        var bestSpan = int.MaxValue;
+        for (var i = 0; i < _foldingRegions.Count; i++)
+        {
+            var region = _foldingRegions[i];
+            if (cursorLine >= region.StartLine && cursorLine <= region.EndLine)
+            {
+                var span = region.EndLine - region.StartLine;
+                if (span < bestSpan)
+                {
+                    bestSpan = span;
+                    bestIndex = i;
+                }
+            }
+        }
+
+        if (bestIndex >= 0)
+            ToggleFoldingRegion(bestIndex);
+    }
+
+    private void ToggleFoldingRegion(int index)
+    {
+        if (index < 0 || index >= _foldingRegions.Count) return;
+        var region = _foldingRegions[index];
+        var updated = new List<FoldingRegion>(_foldingRegions);
+        updated[index] = region with { IsCollapsed = !region.IsCollapsed };
+        _foldingRegions = updated;
+        _foldingGutterProvider.SetRegions(_foldingRegions, ToggleFoldingRegion);
+        MarkDirty();
+    }
+
+    /// <summary>
+    /// After a downward cursor move, if the cursor landed inside a collapsed region
+    /// (between StartLine+1 and EndLine), skip to the line after EndLine.
+    /// </summary>
+    private void AdjustCursorAfterMoveDown()
+    {
+        if (_foldingRegions.Count == 0 || State == null) return;
+
+        foreach (var cursor in State.Cursors)
+        {
+            var offset = Math.Min(cursor.Position.Value, State.Document.Length);
+            var pos = State.Document.OffsetToPosition(new DocumentOffset(offset));
+
+            foreach (var region in _foldingRegions)
+            {
+                if (region.IsCollapsed && pos.Line > region.StartLine && pos.Line <= region.EndLine)
+                {
+                    // Land on the line after the collapsed region
+                    var targetLine = Math.Min(region.EndLine + 1, State.Document.LineCount);
+                    var targetCol = Math.Min(pos.Column, State.Document.GetLineLength(targetLine) + 1);
+                    cursor.Position = State.Document.PositionToOffset(new DocumentPosition(targetLine, targetCol));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// After an upward cursor move, if the cursor landed inside a collapsed region
+    /// (between StartLine+1 and EndLine), snap to the region's StartLine.
+    /// </summary>
+    private void AdjustCursorAfterMoveUp()
+    {
+        if (_foldingRegions.Count == 0 || State == null) return;
+
+        foreach (var cursor in State.Cursors)
+        {
+            var offset = Math.Min(cursor.Position.Value, State.Document.Length);
+            var pos = State.Document.OffsetToPosition(new DocumentOffset(offset));
+
+            foreach (var region in _foldingRegions)
+            {
+                if (region.IsCollapsed && pos.Line > region.StartLine && pos.Line <= region.EndLine)
+                {
+                    var targetCol = Math.Min(pos.Column, State.Document.GetLineLength(region.StartLine) + 1);
+                    cursor.Position = State.Document.PositionToOffset(new DocumentPosition(region.StartLine, targetCol));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Before an edit operation, expand any collapsed region whose start line contains the cursor.
+    /// </summary>
+    private void ExpandFoldsAtCursor()
+    {
+        if (_foldingRegions.Count == 0 || State == null) return;
+
+        var offset = Math.Min(State.Cursor.Position.Value, State.Document.Length);
+        var pos = State.Document.OffsetToPosition(new DocumentOffset(offset));
+
+        var changed = false;
+        var updated = new List<FoldingRegion>(_foldingRegions);
+        for (var i = 0; i < updated.Count; i++)
+        {
+            var region = updated[i];
+            if (region.IsCollapsed && pos.Line == region.StartLine)
+            {
+                updated[i] = region with { IsCollapsed = false };
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            _foldingRegions = updated;
+            _foldingGutterProvider.SetRegions(_foldingRegions, ToggleFoldingRegion);
+        }
+    }
+
+    // ── Breadcrumbs ────────────────────────────────────────────
+
+    void IEditorSession.SetBreadcrumbs(BreadcrumbData? data)
+    {
+        _breadcrumbs = data;
+    }
+
+    BreadcrumbData? IEditorSession.Breadcrumbs => _breadcrumbs;
+
+    // ── Action menu ────────────────────────────────────────────
+
+    Task<string?> IEditorSession.ShowActionMenuAsync(ActionMenu menu)
+    {
+        // TODO: Render popup overlay and await user selection
+        return Task.FromResult<string?>(null);
+    }
+
+    // ── Signature panel ────────────────────────────────────────
+
+    void IEditorSession.ShowSignaturePanel(SignaturePanel panel)
+    {
+        _signaturePanel = panel;
+    }
+
+    void IEditorSession.DismissSignaturePanel()
+    {
+        _signaturePanel = null;
+    }
+
+    // ── Gutter providers ────────────────────────────────────────
+
+    private int GetGutterWidth()
+    {
+        if (State == null) return 0;
+        var providers = EffectiveGutterProviders;
+        if (providers.Count == 0) return 0;
+
+        var total = 0;
+        foreach (var provider in providers)
+            total += provider.GetWidth(State.Document);
+        return total;
     }
 
     // ── Scrollbar rendering ─────────────────────────────────────
 
+    /// <summary>
+    /// Returns the max line width across the entire document, cached by document version.
+    /// </summary>
+    private int GetDocumentMaxLineWidth()
+    {
+        if (State == null) return 0;
+        var doc = State.Document;
+        var version = doc.Version;
+        if (version == _cachedDocMaxWidthVersion)
+            return _cachedDocMaxWidth;
+
+        var max = 0;
+        for (var line = 1; line <= doc.LineCount; line++)
+        {
+            var w = DisplayWidth.GetStringWidth(doc.GetLineText(line));
+            if (w > max) max = w;
+        }
+
+        _cachedDocMaxWidth = max;
+        _cachedDocMaxWidthVersion = version;
+        return max;
+    }
+
+    /// <summary>
+    /// Returns total visual lines accounting for collapsed folding regions.
+    /// </summary>
+    private int GetVisualTotalLines()
+    {
+        if (State == null) return 0;
+        var totalLines = ViewRenderer.GetTotalLines(State.Document, Bounds.Width);
+        return TextEditorViewRenderer.GetVisualLineCount(totalLines, _foldingRegions);
+    }
+
     private (int thumbSize, int thumbStart) CalculateVerticalThumb()
     {
-        var totalLines = ViewRenderer.GetTotalLines(State.Document, Bounds.Width);
-        var trackHeight = _viewportLines;
+        var totalLines = Math.Max(1, GetVisualTotalLines());
+        var trackHeight = Math.Max(1, _viewportLines);
         var thumbSize = Math.Max(1, (int)Math.Ceiling((double)trackHeight / totalLines * trackHeight));
         thumbSize = Math.Min(thumbSize, trackHeight);
 
         var maxScroll = Math.Max(1, totalLines - _viewportLines);
-        var scrollFraction = maxScroll > 0 ? (double)(_scrollOffset - 1) / maxScroll : 0;
+        var scrollFraction = (double)(_scrollOffset - 1) / maxScroll;
+        scrollFraction = Math.Clamp(scrollFraction, 0, 1);
         var thumbStart = (int)Math.Round(scrollFraction * (trackHeight - thumbSize));
         thumbStart = Math.Clamp(thumbStart, 0, trackHeight - thumbSize);
 
@@ -278,13 +926,16 @@ public sealed class EditorNode : Hex1bNode
 
     private (int thumbSize, int thumbStart) CalculateHorizontalThumb()
     {
-        var maxWidth = ViewRenderer.GetMaxLineWidth(State.Document, _scrollOffset, _viewportLines, _viewportColumns);
-        var trackWidth = _viewportColumns;
+        var maxWidth = GetDocumentMaxLineWidth();
+        var trackWidth = Math.Max(1, _viewportColumns);
+        if (maxWidth <= 0) maxWidth = 1;
+
         var thumbSize = Math.Max(1, (int)Math.Ceiling((double)trackWidth / maxWidth * trackWidth));
         thumbSize = Math.Min(thumbSize, trackWidth);
 
         var maxHScroll = Math.Max(1, maxWidth - _viewportColumns);
-        var scrollFraction = maxHScroll > 0 ? (double)_horizontalScrollOffset / maxHScroll : 0;
+        var scrollFraction = (double)_horizontalScrollOffset / maxHScroll;
+        scrollFraction = Math.Clamp(scrollFraction, 0, 1);
         var thumbStart = (int)Math.Round(scrollFraction * (trackWidth - thumbSize));
         thumbStart = Math.Clamp(thumbStart, 0, trackWidth - thumbSize);
 
@@ -326,15 +977,28 @@ public sealed class EditorNode : Hex1bNode
             : theme.Get(ScrollTheme.ThumbColor);
         var bg = theme.Get(EditorTheme.BackgroundColor);
 
+        var gutterWidth = GetGutterWidth();
         var scrollY = Bounds.Y + Bounds.Height - 1;
         var (thumbSize, thumbStart) = CalculateHorizontalThumb();
 
+        // Fill gutter area on the scrollbar row with gutter background
+        if (gutterWidth > 0)
+        {
+            var gutterBg = theme.Get(GutterTheme.BackgroundColor);
+            if (gutterBg.IsDefault) gutterBg = bg;
+            var fill = new string(' ', gutterWidth);
+            context.WriteClipped(Bounds.X, scrollY,
+                $"{gutterBg.ToBackgroundAnsi()}{fill}");
+        }
+
+        // Render track/thumb aligned with text content area
+        var trackX = Bounds.X + gutterWidth;
         for (var col = 0; col < _viewportColumns; col++)
         {
             var isThumb = col >= thumbStart && col < thumbStart + thumbSize;
             var ch = isThumb ? thumbChar : trackChar;
             var color = isThumb ? thumbColor : trackColor;
-            context.WriteClipped(Bounds.X + col, scrollY,
+            context.WriteClipped(trackX + col, scrollY,
                 $"{color.ToForegroundAnsi()}{bg.ToBackgroundAnsi()}{ch}");
         }
     }
@@ -348,14 +1012,17 @@ public sealed class EditorNode : Hex1bNode
         var cursorLine = cursorPos.Line;
         var cursorColumn = cursorPos.Column - 1; // 0-based
 
-        // Vertical visibility
-        if (cursorLine < _scrollOffset)
+        // Convert to visual line for scroll comparison (folds collapse multiple doc lines)
+        var cursorVisualLine = TextEditorViewRenderer.MapDocLineToViewLine(cursorLine, _foldingRegions);
+
+        // Vertical visibility (using visual lines so folds don't cause jumps)
+        if (cursorVisualLine < _scrollOffset)
         {
-            _scrollOffset = cursorLine;
+            _scrollOffset = cursorVisualLine;
         }
-        else if (cursorLine >= _scrollOffset + _viewportLines)
+        else if (cursorVisualLine >= _scrollOffset + _viewportLines)
         {
-            _scrollOffset = cursorLine - _viewportLines + 1;
+            _scrollOffset = cursorVisualLine - _viewportLines + 1;
         }
 
         // Horizontal visibility — use display widths for viewport comparison
@@ -419,6 +1086,31 @@ public sealed class EditorNode : Hex1bNode
 
     private async Task InsertTextAsync(string text, InputBindingActionContext ctx)
     {
+        // If completion is active and user types a non-trigger character, filter the list
+        if (_completionController is { IsActive: true } && text != ".")
+        {
+            // Let the text be inserted first, then filter
+            if (text.Length == 1 && (char.IsLetterOrDigit(text[0]) || text[0] == '_'))
+            {
+                _completionFilterPrefix += text;
+                // Insert the text
+                _pendingNibble = null;
+                State.InsertText(text);
+                AfterEdit();
+                if (TextChangedAction != null) await TextChangedAction(ctx);
+
+                // Now filter the completion list
+                _completionController.Filter(_completionFilterPrefix);
+                MarkDirty();
+                return;
+            }
+            else
+            {
+                _completionController.Dismiss();
+                _completionFilterPrefix = "";
+            }
+        }
+
         // Let the view renderer intercept character input (e.g., hex byte editing)
         if (text.Length == 1 && ViewRenderer.HandlesCharInput)
         {
@@ -445,10 +1137,21 @@ public sealed class EditorNode : Hex1bNode
         State.InsertText(text);
         AfterEdit();
         if (TextChangedAction != null) await TextChangedAction(ctx);
+
+        // Trigger completion after typing '.'
+        if (text == ".")
+        {
+            await RequestCompletionAtCursorAsync(triggerCharacter: ".");
+        }
     }
 
     private async Task InsertNewlineAsync(InputBindingActionContext ctx)
     {
+        if (_completionController is { IsActive: true })
+        {
+            AcceptCompletion();
+            return;
+        }
         State.InsertText("\n");
         AfterEdit();
         if (TextChangedAction != null) await TextChangedAction(ctx);
@@ -463,6 +1166,23 @@ public sealed class EditorNode : Hex1bNode
 
     private async Task DeleteBackwardAsync(InputBindingActionContext ctx)
     {
+        // If completion is active, shrink the filter prefix or dismiss
+        if (_completionController is { IsActive: true } && _completionFilterPrefix.Length > 0)
+        {
+            _completionFilterPrefix = _completionFilterPrefix[..^1];
+            State.DeleteBackward();
+            AfterEdit();
+            if (TextChangedAction != null) await TextChangedAction(ctx);
+            _completionController.Filter(_completionFilterPrefix);
+            MarkDirty();
+            return;
+        }
+        else if (_completionController is { IsActive: true })
+        {
+            _completionController.Dismiss();
+            _completionFilterPrefix = "";
+        }
+
         State.DeleteBackward();
         AfterEdit();
         if (TextChangedAction != null) await TextChangedAction(ctx);
@@ -496,10 +1216,202 @@ public sealed class EditorNode : Hex1bNode
         if (TextChangedAction != null) await TextChangedAction(ctx);
     }
 
+    // --- Input handlers: completion ---
+
+    private void HandleEscape()
+    {
+        if (_completionController is { IsActive: true })
+        {
+            _completionController.Dismiss();
+            _completionFilterPrefix = "";
+            MarkDirty();
+            return;
+        }
+
+        // Collapse multi-cursor back to single cursor
+        if (State.Cursors.Count > 1)
+        {
+            State.CollapseToSingleCursor();
+            AfterMove();
+        }
+    }
+
+    private async Task TriggerCompletionAsync(InputBindingActionContext ctx)
+    {
+        await RequestCompletionAtCursorAsync();
+    }
+
+    private async Task TriggerHoverAsync(InputBindingActionContext ctx)
+    {
+        var provider = FindLspProvider();
+        if (provider == null) return;
+
+        var pos = State.Document.OffsetToPosition(State.Cursor.Position);
+        try
+        {
+            await provider.RequestHoverAsync(pos.Line, pos.Column);
+            MarkDirty();
+        }
+        catch { }
+    }
+
+    private async Task TriggerDefinitionAsync(InputBindingActionContext ctx)
+    {
+        var provider = FindLspProvider();
+        if (provider == null) return;
+
+        var pos = State.Document.OffsetToPosition(State.Cursor.Position);
+        try
+        {
+            var locations = await provider.RequestDefinitionAsync(pos.Line, pos.Column);
+            if (locations.Length > 0)
+            {
+                // Navigate to the first definition in the same document
+                var firstLocal = locations.FirstOrDefault(l => l.Uri == provider.DocumentUriForCompletion);
+                if (firstLocal?.Range != null)
+                {
+                    var targetLine = firstLocal.Range.Start.Line + 1;
+                    var targetCol = firstLocal.Range.Start.Character + 1;
+                    var offset = State.Document.PositionToOffset(new DocumentPosition(targetLine, targetCol));
+                    State.SetCursorPosition(offset);
+                    NotifyCursorChanged();
+                    MarkDirty();
+                }
+            }
+        }
+        catch { }
+    }
+
+    private async Task TriggerReferencesAsync(InputBindingActionContext ctx)
+    {
+        var provider = FindLspProvider();
+        if (provider == null) return;
+
+        var pos = State.Document.OffsetToPosition(State.Cursor.Position);
+        try
+        {
+            await provider.RequestReferencesAsync(pos.Line, pos.Column);
+            MarkDirty();
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Requests folding ranges, document symbols, and inlay hints from the LSP server.
+    /// Called after document open/change to refresh structural features.
+    /// </summary>
+    internal async Task RefreshLspFeaturesAsync()
+    {
+        var provider = FindLspProvider();
+        if (provider == null) return;
+
+        try
+        {
+            // Fire-and-forget all structural feature requests in parallel
+            var tasks = new List<Task>();
+            tasks.Add(provider.RequestFoldingRangesAsync());
+            tasks.Add(provider.RequestDocumentSymbolsAsync());
+
+            // Inlay hints need a visible range
+            if (_viewportLines > 0)
+                tasks.Add(provider.RequestInlayHintsAsync(_scrollOffset, _scrollOffset + _viewportLines));
+
+            await Task.WhenAll(tasks);
+            MarkDirty();
+        }
+        catch { }
+    }
+
+    private async Task RequestCompletionAtCursorAsync(string? triggerCharacter = null)
+    {
+        var provider = FindLspProvider();
+        if (provider == null) return;
+
+        var pos = State.Document.OffsetToPosition(State.Cursor.Position);
+        var line = pos.Line;
+        var column = pos.Column;
+
+        // Ensure controller exists and is attached
+        _completionController ??= new CompletionController();
+        _completionController.Attach(this);
+        _completionFilterPrefix = "";
+
+        try
+        {
+            var client = GetLspClient(provider);
+            if (client == null) return;
+
+            var docUri = GetDocumentUri(provider);
+
+            // Sync the latest document content to the LS before requesting completions.
+            // Use provider.SyncDocumentAsync to also update _lastDocVersion, preventing
+            // the background GetDecorations() sync from double-sending didChange.
+            await provider.SyncDocumentAsync(State.Document);
+
+            var context = new CompletionContext
+            {
+                TriggerKind = triggerCharacter != null ? 2 : 1, // 2=TriggerCharacter, 1=Invoked
+                TriggerCharacter = triggerCharacter,
+            };
+
+            var result = await client.RequestCompletionAsync(docUri, line - 1, column - 1, context);
+
+            if (result?.Items is { Length: > 0 })
+            {
+                _completionController.Show(result.Items, new DocumentPosition(line, column));
+                MarkDirty();
+            }
+            else
+            {
+                _completionController.Dismiss();
+            }
+        }
+        catch
+        {
+            _completionController.Dismiss();
+        }
+    }
+
+    private void AcceptCompletion()
+    {
+        if (_completionController == null) return;
+
+        var insertText = _completionController.Accept();
+        _completionFilterPrefix = "";
+        if (insertText != null)
+        {
+            State.InsertText(insertText);
+            AfterEdit();
+        }
+    }
+
+    private LanguageServerDecorationProvider? FindLspProvider()
+    {
+        if (DecorationProviders == null) return null;
+        foreach (var p in DecorationProviders)
+        {
+            if (p is LanguageServerDecorationProvider lsp)
+                return lsp;
+        }
+        return null;
+    }
+
+    private static LanguageServerClient? GetLspClient(LanguageServerDecorationProvider provider)
+    {
+        // Access the active client via the provider's internal property
+        return provider.ActiveClientForCompletion;
+    }
+
+    private static string GetDocumentUri(LanguageServerDecorationProvider provider)
+    {
+        return provider.DocumentUriForCompletion;
+    }
+
     // --- Input handlers: navigation ---
 
     private void MoveLeft()
     {
+        _completionController?.Dismiss();
         if (!ViewRenderer.HandleNavigation(CursorDirection.Left, State, extend: false, ViewportColumns))
             State.MoveCursor(CursorDirection.Left);
         AfterMove();
@@ -507,6 +1419,7 @@ public sealed class EditorNode : Hex1bNode
 
     private void MoveRight()
     {
+        _completionController?.Dismiss();
         if (!ViewRenderer.HandleNavigation(CursorDirection.Right, State, extend: false, ViewportColumns))
             State.MoveCursor(CursorDirection.Right);
         AfterMove();
@@ -514,15 +1427,29 @@ public sealed class EditorNode : Hex1bNode
 
     private void MoveUp()
     {
+        if (_completionController is { IsActive: true })
+        {
+            _completionController.SelectPrev();
+            MarkDirty();
+            return;
+        }
         if (!ViewRenderer.HandleNavigation(CursorDirection.Up, State, extend: false, ViewportColumns))
             State.MoveCursor(CursorDirection.Up);
+        AdjustCursorAfterMoveUp();
         AfterMove();
     }
 
     private void MoveDown()
     {
+        if (_completionController is { IsActive: true })
+        {
+            _completionController.SelectNext();
+            MarkDirty();
+            return;
+        }
         if (!ViewRenderer.HandleNavigation(CursorDirection.Down, State, extend: false, ViewportColumns))
             State.MoveCursor(CursorDirection.Down);
+        AdjustCursorAfterMoveDown();
         AfterMove();
     }
     private void MoveToLineStart() { State.MoveToLineStart(); AfterMove(); }
@@ -531,8 +1458,8 @@ public sealed class EditorNode : Hex1bNode
     private void MoveToDocumentEnd() { State.MoveToDocumentEnd(); AfterMove(); }
     private void MoveWordLeft() { State.MoveWordLeft(); AfterMove(); }
     private void MoveWordRight() { State.MoveWordRight(); AfterMove(); }
-    private void PageUp() { State.MovePageUp(ViewportLines); AfterMove(); }
-    private void PageDown() { State.MovePageDown(ViewportLines); AfterMove(); }
+    private void PageUp() { State.MovePageUp(ViewportLines); AdjustCursorAfterMoveUp(); AfterMove(); }
+    private void PageDown() { State.MovePageDown(ViewportLines); AdjustCursorAfterMoveDown(); AfterMove(); }
 
     // --- Input handlers: selection ---
 
@@ -554,6 +1481,7 @@ public sealed class EditorNode : Hex1bNode
     {
         if (!ViewRenderer.HandleNavigation(CursorDirection.Up, State, extend: true, ViewportColumns))
             State.MoveCursor(CursorDirection.Up, extend: true);
+        AdjustCursorAfterMoveUp();
         AfterMove();
     }
 
@@ -561,6 +1489,7 @@ public sealed class EditorNode : Hex1bNode
     {
         if (!ViewRenderer.HandleNavigation(CursorDirection.Down, State, extend: true, ViewportColumns))
             State.MoveCursor(CursorDirection.Down, extend: true);
+        AdjustCursorAfterMoveDown();
         AfterMove();
     }
     private void SelectToLineStart() { State.MoveToLineStart(extend: true); AfterMove(); }
@@ -569,8 +1498,8 @@ public sealed class EditorNode : Hex1bNode
     private void SelectToDocumentEnd() { State.MoveToDocumentEnd(extend: true); AfterMove(); }
     private void SelectWordLeft() { State.MoveWordLeft(extend: true); AfterMove(); }
     private void SelectWordRight() { State.MoveWordRight(extend: true); AfterMove(); }
-    private void SelectPageUp() { State.MovePageUp(ViewportLines, extend: true); AfterMove(); }
-    private void SelectPageDown() { State.MovePageDown(ViewportLines, extend: true); AfterMove(); }
+    private void SelectPageUp() { State.MovePageUp(ViewportLines, extend: true); AdjustCursorAfterMoveUp(); AfterMove(); }
+    private void SelectPageDown() { State.MovePageDown(ViewportLines, extend: true); AdjustCursorAfterMoveDown(); AfterMove(); }
     private void SelectAll() { State.SelectAll(); MarkDirty(); }
 
     // --- Input handlers: multi-cursor ---
@@ -595,6 +1524,7 @@ public sealed class EditorNode : Hex1bNode
     {
         _pendingNibble = null;
         _cursorDirty = true;
+        ExpandFoldsAtCursor();
         MarkDirty();
     }
 
@@ -607,7 +1537,8 @@ public sealed class EditorNode : Hex1bNode
 
     private HitZone GetHitZone(int localX, int localY)
     {
-        var inScrollbarCol = _showVerticalScrollbar && localX >= _viewportColumns;
+        var gutterWidth = GetGutterWidth();
+        var inScrollbarCol = _showVerticalScrollbar && localX >= _viewportColumns + gutterWidth;
         var inScrollbarRow = _showHorizontalScrollbar && localY >= _viewportLines;
 
         if (inScrollbarCol && inScrollbarRow) return HitZone.Corner;
@@ -629,6 +1560,34 @@ public sealed class EditorNode : Hex1bNode
 
         if (GetHitZone(localX, localY) != HitZone.Content) return null;
 
+        // Adjust for gutter area
+        var gutterWidth = GetGutterWidth();
+        if (gutterWidth > 0)
+        {
+            if (localX < gutterWidth)
+            {
+                // Click is in gutter area — route to provider
+                var providerX = 0;
+                var gutterProviders = EffectiveGutterProviders;
+                if (State != null)
+                {
+                    var docLine = _scrollOffset + localY;
+                    foreach (var provider in gutterProviders)
+                    {
+                        var pw = provider.GetWidth(State.Document);
+                        if (localX < providerX + pw)
+                        {
+                            provider.HandleClick(docLine);
+                            break;
+                        }
+                        providerX += pw;
+                    }
+                }
+                return null;
+            }
+            localX -= gutterWidth;
+        }
+
         return ViewRenderer.HitTest(localX, localY, State, _viewportColumns, _viewportLines, _scrollOffset, _horizontalScrollOffset);
     }
 
@@ -644,7 +1603,7 @@ public sealed class EditorNode : Hex1bNode
                 HandleVerticalScrollbarClick(localY);
                 return;
             case HitZone.HorizontalScrollbar:
-                HandleHorizontalScrollbarClick(localX);
+                HandleHorizontalScrollbarClick(localX - GetGutterWidth());
                 return;
             case HitZone.Corner:
                 return; // Ignore corner clicks
@@ -660,6 +1619,7 @@ public sealed class EditorNode : Hex1bNode
     {
         if (State == null) return;
         var (thumbSize, thumbStart) = CalculateVerticalThumb();
+        var prevOffset = _scrollOffset;
 
         if (localY < thumbStart)
         {
@@ -670,21 +1630,22 @@ public sealed class EditorNode : Hex1bNode
         else if (localY >= thumbStart + thumbSize)
         {
             // Page down
-            var totalLines = ViewRenderer.GetTotalLines(State.Document, Bounds.Width);
+            var totalLines = GetVisualTotalLines();
             var maxScroll = Math.Max(1, totalLines - _viewportLines + 1);
             var pageSize = Math.Max(1, _viewportLines - 1);
             _scrollOffset = Math.Min(maxScroll, _scrollOffset + pageSize);
         }
 
-        MarkDirty();
+        if (_scrollOffset != prevOffset)
+            MarkDirty();
     }
 
     private void HandleHorizontalScrollbarClick(int localX)
     {
         if (State == null) return;
         var (thumbSize, thumbStart) = CalculateHorizontalThumb();
-        var maxWidth = ViewRenderer.GetMaxLineWidth(State.Document, _scrollOffset, _viewportLines, _viewportColumns);
-        var maxHScroll = Math.Max(0, maxWidth - _viewportColumns);
+        var maxHScroll = Math.Max(0, GetDocumentMaxLineWidth() - _viewportColumns);
+        var prevOffset = _horizontalScrollOffset;
 
         if (localX < thumbStart)
         {
@@ -699,7 +1660,8 @@ public sealed class EditorNode : Hex1bNode
             _horizontalScrollOffset = Math.Min(maxHScroll, _horizontalScrollOffset + pageSize);
         }
 
-        MarkDirty();
+        if (_horizontalScrollOffset != prevOffset)
+            MarkDirty();
     }
 
     private void HandleCtrlClick(InputBindingActionContext ctx)
@@ -736,7 +1698,7 @@ public sealed class EditorNode : Hex1bNode
         if (zone == HitZone.VerticalScrollbar)
             return HandleVerticalScrollbarDrag(startY);
         if (zone == HitZone.HorizontalScrollbar)
-            return HandleHorizontalScrollbarDrag(startX);
+            return HandleHorizontalScrollbarDrag(startX - GetGutterWidth());
 
         // Content area — text selection drag
         var absStartX = startX + Bounds.X;
@@ -774,7 +1736,7 @@ public sealed class EditorNode : Hex1bNode
 
         // Thumb drag
         var startScrollOffset = _scrollOffset;
-        var totalLines = ViewRenderer.GetTotalLines(State.Document, Bounds.Width);
+        var totalLines = GetVisualTotalLines();
         var maxScroll = Math.Max(1, totalLines - _viewportLines);
         var scrollRange = _viewportLines - thumbSize;
         var contentPerPixel = scrollRange > 0 ? (double)maxScroll / scrollRange : 0;
@@ -804,8 +1766,7 @@ public sealed class EditorNode : Hex1bNode
 
         // Thumb drag
         var startHOffset = _horizontalScrollOffset;
-        var maxWidth = ViewRenderer.GetMaxLineWidth(State.Document, _scrollOffset, _viewportLines, _viewportColumns);
-        var maxHScroll = Math.Max(1, maxWidth - _viewportColumns);
+        var maxHScroll = Math.Max(1, GetDocumentMaxLineWidth() - _viewportColumns);
         var scrollRange = _viewportColumns - thumbSize;
         var contentPerPixel = scrollRange > 0 ? (double)maxHScroll / scrollRange : 0;
 
@@ -833,7 +1794,7 @@ public sealed class EditorNode : Hex1bNode
     private void ScrollDown()
     {
         if (State == null) return;
-        var totalLines = ViewRenderer.GetTotalLines(State.Document, Bounds.Width);
+        var totalLines = GetVisualTotalLines();
         var maxScroll = Math.Max(1, totalLines - _viewportLines + 1);
         if (_scrollOffset < maxScroll)
         {
@@ -854,8 +1815,7 @@ public sealed class EditorNode : Hex1bNode
     private void ScrollRight()
     {
         if (State == null) return;
-        var maxWidth = ViewRenderer.GetMaxLineWidth(State.Document, _scrollOffset, _viewportLines, _viewportColumns);
-        var maxHScroll = Math.Max(0, maxWidth - _viewportColumns);
+        var maxHScroll = Math.Max(0, GetDocumentMaxLineWidth() - _viewportColumns);
         if (_horizontalScrollOffset < maxHScroll)
         {
             _horizontalScrollOffset = Math.Min(maxHScroll, _horizontalScrollOffset + 4);

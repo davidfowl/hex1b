@@ -1,5 +1,7 @@
+using Hex1b.Documents;
 using Hex1b.Events;
 using Hex1b.Input;
+using Hex1b.LanguageServer;
 using Hex1b.Nodes;
 
 namespace Hex1b.Widgets;
@@ -107,6 +109,9 @@ public sealed record EditorWidget(EditorState State) : Hex1bWidget
     /// <summary>Rebindable action: Scroll right.</summary>
     public static readonly ActionId ScrollRight = new($"{nameof(EditorWidget)}.{nameof(ScrollRight)}");
 
+    /// <summary>Rebindable action: Toggle fold at cursor line.</summary>
+    public static readonly ActionId ToggleFold = new($"{nameof(EditorWidget)}.{nameof(ToggleFold)}");
+
     /// <summary>
     /// Internal handler for text changed events.
     /// </summary>
@@ -117,6 +122,36 @@ public sealed record EditorWidget(EditorState State) : Hex1bWidget
     /// Defaults to TextEditorViewRenderer (plain text).
     /// </summary>
     internal IEditorViewRenderer? Renderer { get; init; }
+
+    /// <summary>
+    /// Text decoration providers for syntax highlighting, diagnostics, etc.
+    /// </summary>
+    internal IReadOnlyList<ITextDecorationProvider>? DecorationProviders { get; init; }
+
+    /// <summary>
+    /// Whether to show line numbers in a gutter on the left side of the editor.
+    /// </summary>
+    internal bool ShowLineNumbersValue { get; init; }
+
+    /// <summary>
+    /// Gutter providers for the editor's left margin.
+    /// </summary>
+    internal IReadOnlyList<IGutterProvider>? GutterProvidersValue { get; init; }
+
+    /// <summary>
+    /// The language extension for this editor, controlling per-language LSP behavior.
+    /// </summary>
+    internal ILanguageExtension? ExtensionValue { get; init; }
+
+    /// <summary>
+    /// Override feature set. When set, this takes precedence over the extension's EnabledFeatures.
+    /// </summary>
+    internal LspFeatureSet? FeaturesValue { get; init; }
+
+    /// <summary>
+    /// Whether to enable soft line wrapping.
+    /// </summary>
+    internal bool WordWrapValue { get; init; }
 
     /// <summary>
     /// Sets a synchronous handler called when the document text changes.
@@ -137,6 +172,50 @@ public sealed record EditorWidget(EditorState State) : Hex1bWidget
     public EditorWidget WithViewRenderer(IEditorViewRenderer renderer)
         => this with { Renderer = renderer };
 
+    /// <summary>
+    /// Adds a text decoration provider to the editor. Providers supply per-character styling
+    /// such as syntax highlighting, diagnostic underlines, and other visual decorations.
+    /// Multiple providers can be added; their decorations are resolved by priority.
+    /// </summary>
+    public EditorWidget Decorations(ITextDecorationProvider provider)
+        => this with { DecorationProviders = [..(DecorationProviders ?? []), provider] };
+
+    /// <summary>
+    /// Enables or disables line numbers in a gutter on the left side of the editor.
+    /// This is a convenience method that adds a <see cref="LineNumberGutterProvider"/>.
+    /// </summary>
+    public EditorWidget LineNumbers(bool show = true)
+        => this with { ShowLineNumbersValue = show };
+
+    /// <summary>
+    /// Adds a gutter provider to the editor's left margin. Multiple providers
+    /// are rendered left-to-right in registration order.
+    /// </summary>
+    public EditorWidget Gutter(IGutterProvider provider)
+        => this with { GutterProvidersValue = [..(GutterProvidersValue ?? []), provider] };
+
+    /// <summary>
+    /// Sets the language extension for this editor. The extension controls which
+    /// LSP features are enabled and can customize rendering of LSP results.
+    /// </summary>
+    internal EditorWidget Extension(ILanguageExtension extension)
+        => this with { ExtensionValue = extension };
+
+    /// <summary>
+    /// Overrides the enabled LSP feature set. When specified, this takes precedence
+    /// over the extension's <see cref="ILanguageExtension.EnabledFeatures"/>.
+    /// Use to selectively enable or disable features without creating a custom extension.
+    /// </summary>
+    public EditorWidget Features(LspFeatureSet features)
+        => this with { FeaturesValue = features };
+
+    /// <summary>
+    /// Enables or disables soft line wrapping. When enabled, lines that exceed
+    /// the viewport width are visually wrapped to the next display line.
+    /// </summary>
+    public EditorWidget WordWrap(bool enabled = true)
+        => this with { WordWrapValue = enabled };
+
     internal override Task<Hex1bNode> ReconcileAsync(Hex1bNode? existingNode, ReconcileContext context)
     {
         var node = existingNode as EditorNode ?? new EditorNode();
@@ -145,6 +224,12 @@ public sealed record EditorWidget(EditorState State) : Hex1bWidget
         node.State = State;
 
         node.ViewRenderer = Renderer ?? TextEditorViewRenderer.Instance;
+        node.ShowLineNumbers = ShowLineNumbersValue;
+        node.WordWrap = WordWrapValue;
+        node.GutterProviders = GutterProvidersValue != null ? [..GutterProvidersValue] : [];
+
+        // Activate/deactivate decoration providers when they change
+        node.UpdateDecorationProviders(DecorationProviders);
 
         if (TextChangedHandler != null)
         {
