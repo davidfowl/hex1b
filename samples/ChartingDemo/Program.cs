@@ -277,7 +277,8 @@ var terminal = Hex1bTerminal.CreateBuilder()
             ]),
             tp.Tab("Breakdown", t => [
                 t.BreakdownChart(diskUsage)
-                    .Title("Disk Usage")
+                    .Title("Disk Usage"),
+                t.Legend(diskUsage)
                     .ShowPercentages()
                     .ShowValues(),
                 t.Separator(),
@@ -293,6 +294,23 @@ var terminal = Hex1bTerminal.CreateBuilder()
                             r.Cell($"{pct:F1}%"),
                         ];
                     })
+            ]),
+            tp.Tab("Donut", t => [
+                t.DonutChart(diskUsage)
+                    .Title("Disk Usage")
+                    .FillHeight(),
+                t.Legend(diskUsage)
+                    .ShowPercentages()
+                    .ShowValues(),
+            ]),
+            tp.Tab("Pie", t => [
+                t.DonutChart(diskUsage)
+                    .Title("Disk Usage (Pie)")
+                    .HoleSize(0)
+                    .FillHeight(),
+                t.Legend(diskUsage)
+                    .ShowPercentages()
+                    .Horizontal(),
             ]),
             tp.Tab("Time Series", t => [
                 t.TimeSeriesChart(temperatureData)
@@ -365,7 +383,8 @@ var terminal = Hex1bTerminal.CreateBuilder()
                     .FillHeight(),
                 t.Separator(),
                 t.BreakdownChart(budgetBreakdown)
-                    .Title("Department Budgets")
+                    .Title("Department Budgets"),
+                t.Legend(budgetBreakdown)
                     .ShowValues()
                     .ShowPercentages()
                     .FormatValue(v => $"${v / 1_000:N0}K"),
