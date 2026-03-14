@@ -130,6 +130,7 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
         var entries = Windows.All;
         var activeWindow = Windows.ActiveWindow;
         var newWindowNodes = new List<WindowNode>();
+        var hasNewWindow = false;
 
         for (int i = 0; i < entries.Count; i++)
         {
@@ -137,6 +138,7 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
 
             // Find existing node for this entry
             var existingNode = WindowNodes.FirstOrDefault(n => n.Entry?.Id == entry.Id);
+            if (existingNode == null) hasNewWindow = true;
 
             // Create the window widget and reconcile
             var windowWidget = new WindowWidget(entry);
@@ -150,11 +152,13 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
             }
         }
 
-        // Track removed windows for bounds clearing
+        // Track removed windows for bounds clearing and detect closures
+        var hasClosedWindow = false;
         foreach (var oldNode in WindowNodes)
         {
             if (!newWindowNodes.Any(n => n.Entry?.Id == oldNode.Entry?.Id))
             {
+                hasClosedWindow = true;
                 if (oldNode.Bounds.Width > 0 && oldNode.Bounds.Height > 0)
                 {
                     AddOrphanedChildBounds(oldNode.Bounds);
@@ -165,29 +169,41 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
         WindowNodes.Clear();
         WindowNodes.AddRange(newWindowNodes);
 
-        // Focus management: if windows exist, focus the active window's first focusable
-        // But ONLY if parent is not managing focus (e.g., when popups are open, ZStack manages focus)
-        if (activeWindow?.Node != null && !context.ParentManagesFocus())
+        // Focus management for windows.
+        // When a window is opened or closed, focus must move to the active window's
+        // first content focusable. We use RequestFocusCallback so focus is set AFTER
+        // FocusRing.Rebuild with correct focusable state.
+        // 
+        // For new windows: prevents stale FocusRing issues where popup/menu items
+        // still appear focused from the previous cycle.
+        // For closed windows: ensures focus returns to the next window in z-order
+        // instead of falling back to EnsureFocus which picks _focusables[0] (MenuBar).
+        if ((hasNewWindow || hasClosedWindow) && activeWindow?.Node != null)
         {
-            var focusables = activeWindow.Node.GetFocusableNodes().ToList();
-            if (focusables.Count > 0 && !focusables.Any(f => f.IsFocused))
+            var targetNode = activeWindow.Node;
+            if (context.RequestFocusCallback != null)
             {
-                // Clear focus from other windows (not the active one)
-                foreach (var windowNode in WindowNodes)
+                // Deferred focus: runs after FocusRing.Rebuild with correct state.
+                // FocusWhere properly clears old focus and calls SyncAncestorFocusState.
+                // Target the first content focusable (skip WindowNode itself and title bar).
+                var contentNode = targetNode.Content;
+                if (contentNode != null)
                 {
-                    if (!ReferenceEquals(windowNode, activeWindow.Node))
+                    context.RequestFocusCallback(n =>
                     {
-                        foreach (var focusable in windowNode.GetFocusableNodes())
-                        {
-                            if (focusable.IsFocused)
-                            {
-                                ReconcileContext.SetNodeFocus(focusable, false);
-                            }
-                        }
-                    }
+                        var contentFocusables = contentNode.GetFocusableNodes();
+                        return contentFocusables.Any(f => ReferenceEquals(f, n));
+                    });
                 }
-
-                ReconcileContext.SetNodeFocus(focusables[0], true);
+            }
+            else
+            {
+                // Fallback for tests without Hex1bApp (direct node tests)
+                var focusables = targetNode.GetFocusableNodes().ToList();
+                if (focusables.Count > 0 && !focusables.Any(f => f.IsFocused))
+                {
+                    ReconcileContext.SetNodeFocus(focusables[0], true);
+                }
             }
         }
     }

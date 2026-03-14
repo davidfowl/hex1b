@@ -235,6 +235,179 @@ public class Hex1bTerminalTests
     }
 
     [Fact]
+    public async Task PresentationInput_BareEscape_FlushedAfterTimeout()
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24
+        });
+
+        // Send just \x1b with no continuation — after the timeout the
+        // terminal should flush it as a standalone Escape key event.
+        presentation.EnqueueInput("\x1b");
+
+        var evt = await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+        var keyEvent = Assert.IsType<Hex1bKeyEvent>(evt);
+        Assert.Equal(Hex1bKey.Escape, keyEvent.Key);
+        Assert.Equal(Hex1bModifiers.None, keyEvent.Modifiers);
+    }
+
+    [Fact]
+    public async Task PresentationInput_DoubleEscape_DoesNotKillEventPump()
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24
+        });
+
+        // Send two bare escapes back-to-back, then a normal key.
+        // The pump must survive both timeouts and still dispatch the 'a'.
+        presentation.EnqueueInput("\x1b");
+        await Task.Delay(TimeSpan.FromMilliseconds(70));
+        presentation.EnqueueInput("\x1b");
+        await Task.Delay(TimeSpan.FromMilliseconds(70));
+        presentation.EnqueueInput("a");
+
+        var events = new List<Hex1bKeyEvent>();
+        for (int i = 0; i < 3; i++)
+        {
+            var evt = await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken).AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+            events.Add(Assert.IsType<Hex1bKeyEvent>(evt));
+        }
+
+        Assert.Equal(Hex1bKey.Escape, events[0].Key);
+        Assert.Equal(Hex1bKey.Escape, events[1].Key);
+        Assert.Equal(Hex1bKey.A, events[2].Key);
+    }
+
+    [Fact]
+    public async Task PresentationInput_CustomEscapeTimeout_UsesConfiguredValue()
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24,
+            EscapeSequenceTimeout = TimeSpan.FromMilliseconds(10)
+        });
+
+        presentation.EnqueueInput("\x1b");
+
+        var evt = await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+        var keyEvent = Assert.IsType<Hex1bKeyEvent>(evt);
+        Assert.Equal(Hex1bKey.Escape, keyEvent.Key);
+    }
+
+    [Fact]
+    public async Task PresentationInput_ZeroEscapeTimeout_DisablesFlush()
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24,
+            EscapeSequenceTimeout = TimeSpan.Zero
+        });
+
+        // Send bare \x1b — with timeout disabled, it should stay buffered.
+        presentation.EnqueueInput("\x1b");
+
+        // Wait well beyond the default 50ms timeout
+        await Task.Delay(150);
+
+        // No event should have been dispatched
+        Assert.False(workload.InputEvents.TryRead(out _),
+            "With EscapeSequenceTimeout=Zero, bare ESC should stay buffered");
+
+        // Sending a continuation byte should produce the combined sequence (Alt+A)
+        presentation.EnqueueInput("a");
+
+        var evt = await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+        var keyEvent = Assert.IsType<Hex1bKeyEvent>(evt);
+        Assert.Equal(Hex1bKey.A, keyEvent.Key);
+        Assert.Equal(Hex1bModifiers.Alt, keyEvent.Modifiers);
+    }
+
+    [Fact]
+    public async Task AppInput_BareEscape_TriggersEscapeBinding()
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24
+        });
+
+        var escapeTriggered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var status = "Ready";
+
+        using var app = new Hex1bApp(
+            ctx => Task.FromResult<Hex1bWidget>(
+                new VStackWidget([
+                    new TextBlockWidget(status)
+                ]).WithInputBindings(bindings =>
+                {
+                    bindings.Key(Hex1bKey.Escape).Action(_ =>
+                    {
+                        status = "Escape handled";
+                        escapeTriggered.TrySetResult();
+                        return Task.CompletedTask;
+                    }, "Escape binding");
+                })
+            ),
+            new Hex1bAppOptions
+            {
+                WorkloadAdapter = workload,
+                EnableDefaultCtrlCExit = false
+            }
+        );
+
+        using var cts = new CancellationTokenSource();
+        var runTask = app.RunAsync(cts.Token);
+
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("Ready"), TimeSpan.FromSeconds(2), "initial render")
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        // Send bare \x1b — should be flushed as Escape after timeout
+        presentation.EnqueueInput("\x1b");
+
+        await escapeTriggered.Task.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+        Assert.True(escapeTriggered.Task.IsCompletedSuccessfully, "Escape binding should have fired from bare \\x1b");
+
+        cts.Cancel();
+        await runTask;
+    }
+
+    [Fact]
     public async Task Write_HandlesNewlines()
     {
         using var workload = new Hex1bAppWorkloadAdapter();

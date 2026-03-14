@@ -32,15 +32,8 @@ internal sealed record WindowWidget(WindowEntry Entry) : Hex1bWidget
         // Link entry back to node
         Entry.Node = node;
 
-        // Focus first focusable in new windows
-        if (context.IsNew && !context.ParentManagesFocus())
-        {
-            var focusables = node.GetFocusableNodes().ToList();
-            if (focusables.Count > 0)
-            {
-                ReconcileContext.SetNodeFocus(focusables[0], true);
-            }
-        }
+        // Focus for new windows is managed by WindowPanelNode.ReconcileWindowsAsync
+        // using the RequestFocusCallback. No direct focus manipulation needed here.
 
         return node;
     }
