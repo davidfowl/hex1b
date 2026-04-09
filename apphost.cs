@@ -79,7 +79,7 @@ var website = builder.AddCSharpApp("website", "./src/Hex1b.Website")
         }
     });
 
-var content= builder.AddViteApp("content", "./src/content")
+var content=builder.AddViteApp("content", "./src/content")
     .WithReference(website)
     .WaitFor(website)
     .WaitFor(docGenerator)

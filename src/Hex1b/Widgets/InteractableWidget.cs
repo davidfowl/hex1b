@@ -65,19 +65,17 @@ public sealed record InteractableWidget(Func<InteractableContext, Hex1bWidget> B
     public InteractableWidget OnHoverChanged(Action<InteractableHoverChangedEventArgs> handler)
         => this with { HoverChangedHandler = handler };
 
+    /// <summary>
+    /// When true, the node will request focus during reconciliation.
+    /// Used by container builders (e.g., DatePicker) to direct initial focus
+    /// to a specific cell before <c>EnsureFocus</c> runs.
+    /// </summary>
+    internal bool RequestFocus { get; init; }
+
     internal override async Task<Hex1bNode> ReconcileAsync(Hex1bNode? existingNode, ReconcileContext context)
     {
         var node = existingNode as InteractableNode ?? new InteractableNode();
         node.SourceWidget = this;
-
-        // Create context populated with current node state (defaults on first render)
-        var ic = new InteractableContext(node);
-
-        // Build child widget — builder can read ic.IsFocused, ic.IsHovered
-        var childWidget = Builder(ic);
-
-        // Reconcile child
-        node.Child = await context.ReconcileChildAsync(node.Child, childWidget, node);
 
         // Wire up click handler
         if (ClickHandler != null)
@@ -113,6 +111,32 @@ public sealed record InteractableWidget(Func<InteractableContext, Hex1bWidget> B
         {
             node.HoverChangedAction = null;
         }
+
+        // Apply focus request BEFORE building the child so the content builder
+        // sees the correct IsFocused state immediately. Previously this ran after
+        // the child was built, causing a one-frame lag where the focused cell
+        // rendered without its highlight.
+        if (RequestFocus)
+        {
+            if (!node.HasAppliedRequestFocus)
+            {
+                node.IsFocused = true;
+                node.HasAppliedRequestFocus = true;
+            }
+        }
+        else
+        {
+            node.HasAppliedRequestFocus = false;
+        }
+
+        // Create context populated with current node state (now includes correct IsFocused)
+        var ic = new InteractableContext(node);
+
+        // Build child widget — builder can read ic.IsFocused, ic.IsHovered
+        var childWidget = Builder(ic);
+
+        // Reconcile child
+        node.Child = await context.ReconcileChildAsync(node.Child, childWidget, node);
 
         return node;
     }
