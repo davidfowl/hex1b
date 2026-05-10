@@ -266,6 +266,30 @@ Try it yourself—navigate through the text with arrow keys, delete some emoji, 
 
 <CodeBlock lang="csharp" :code="unicodeCode" command="dotnet run" example="textbox-unicode" exampleTitle="TextBox Widget - Unicode Support" />
 
+## Sizing
+
+By default, `TextBoxWidget` reports a `Fill` width hint, so it expands to
+take up whatever horizontal space its parent makes available — input feels
+best on a wide editable surface. Override that default the same way you
+would for any other widget:
+
+```csharp
+ctx.HStack(h => [
+    h.Text("Name:"),
+    h.TextBox(state.Name),                       // fills the rest of the row
+]);
+
+ctx.HStack(h => [
+    h.Text("Code:"),
+    h.TextBox(state.Code).FixedWidth(8),         // hugs an 8-cell field
+    h.Text(" "),
+    h.TextBox(state.Notes).ContentWidth(),       // sizes to its current text
+]);
+```
+
+Multi-line textboxes still default to fill width; height defaults to
+content (one line per visual line) unless you call `.Height(lines)`.
+
 ## Theming
 
 Customize TextBox appearance using theme elements:
@@ -276,8 +300,7 @@ var theme = Hex1bTheme.Create()
     .Set(TextBoxTheme.CursorBackgroundColor, Hex1bColor.Yellow)
     .Set(TextBoxTheme.SelectionForegroundColor, Hex1bColor.White)
     .Set(TextBoxTheme.SelectionBackgroundColor, Hex1bColor.Blue)
-    .Set(TextBoxTheme.LeftBracket, "< ")
-    .Set(TextBoxTheme.RightBracket, " >");
+    .Set(TextBoxTheme.PredictionForegroundColor, Hex1bColor.LightGray);
 
 await using var terminal = Hex1bTerminal.CreateBuilder()
     .WithHex1bApp((app, options) =>
@@ -301,10 +324,8 @@ await terminal.RunAsync();
 | `CursorBackgroundColor` | `Hex1bColor` | White | Cursor background color |
 | `SelectionForegroundColor` | `Hex1bColor` | Black | Selected text color |
 | `SelectionBackgroundColor` | `Hex1bColor` | Cyan | Selection background |
-| `HoverCursorForegroundColor` | `Hex1bColor` | Default | Hover cursor text color |
-| `HoverCursorBackgroundColor` | `Hex1bColor` | DarkGray | Hover cursor background |
-| `LeftBracket` | `string` | `"["` | Left bracket decoration |
-| `RightBracket` | `string` | `"]"` | Right bracket decoration |
+| `PredictionForegroundColor` | `Hex1bColor` | Gray | Inline prediction text color. Monochrome by default for a ghost-text look; theme to any color to brand suggestions. |
+| `PredictionBackgroundColor` | `Hex1bColor` | Default | Inline prediction background. `Default` follows the field fill color; set explicitly to draw the suggestion on a contrasting band. |
 
 ## Related Widgets
 
