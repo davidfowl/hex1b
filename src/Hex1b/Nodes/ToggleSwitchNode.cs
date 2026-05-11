@@ -6,10 +6,22 @@ using Hex1b.Widgets;
 namespace Hex1b;
 
 /// <summary>
-/// A horizontal toggle switch node that renders options side-by-side
-/// and allows selection via left/right arrow keys.
-/// Selection state is owned by this node and preserved across reconciliation.
+/// A horizontal toggle switch node that renders options as adjacent
+/// per-option chips and allows selection via left/right arrow keys
+/// or mouse click. Selection state is owned by this node and
+/// preserved across reconciliation.
 /// </summary>
+/// <remarks>
+/// Each option occupies <c>1 + label_length + 1</c> cells (a single
+/// padding cell on each side of the label) and is painted in its own
+/// colours — the selected option gets the
+/// <see cref="ToggleSwitchTheme.FocusedSelectedBackgroundColor"/> /
+/// <see cref="ToggleSwitchTheme.UnfocusedSelectedBackgroundColor"/>
+/// pair (depending on whether the toggle has focus), and the
+/// unselected options get the
+/// <see cref="ToggleSwitchTheme.UnselectedBackgroundColor"/>. There is
+/// no separator glyph between options.
+/// </remarks>
 public sealed class ToggleSwitchNode : Hex1bNode
 {
     /// <summary>
@@ -98,32 +110,32 @@ public sealed class ToggleSwitchNode : Hex1bNode
     {
         if (Options.Count == 0) return;
 
-        // Calculate which option was clicked based on the X position
-        // Format: "[ Option1 | Option2 | Option3 ]"
+        // Layout: per-option chips of width (1 + label + 1) tiled left
+        // to right with no separator. The whole strip is clickable —
+        // every cell of an option's chip (including its leading and
+        // trailing padding cells) selects that option.
         var localX = ctx.MouseX - Bounds.X;
-        var currentX = 2; // Start after "[ "
-        
+        var currentX = 0;
+
         for (int i = 0; i < Options.Count; i++)
         {
-            var optionWidth = Options[i].Length;
-            var endX = currentX + optionWidth;
-            
+            var chipWidth = Options[i].Length + 2;
+            var endX = currentX + chipWidth; // exclusive
+
             if (localX >= currentX && localX < endX)
             {
                 var previousIndex = SelectedIndex;
                 SelectedIndex = i;
                 MarkDirty();
-                
-                // Fire selection changed if the selection actually changed
+
                 if (previousIndex != SelectedIndex && SelectionChangedAction != null)
                 {
                     await SelectionChangedAction(ctx);
                 }
                 return;
             }
-            
-            // Move past this option and the separator " | " (3 chars)
-            currentX = endX + 3;
+
+            currentX = endX;
         }
     }
 
@@ -148,33 +160,32 @@ public sealed class ToggleSwitchNode : Hex1bNode
     }
 
     /// <summary>
-    /// Handles mouse click by selecting the option at the clicked X position.
+    /// Handles mouse click by selecting the option whose chip contains the click.
     /// </summary>
     public override InputResult HandleMouseClick(int localX, int localY, Hex1bMouseEvent mouseEvent)
     {
         if (Options.Count == 0) return InputResult.NotHandled;
 
-        // Calculate which option was clicked based on the X position
-        // Format: "[ Option1 | Option2 | Option3 ]"
-        // Left bracket takes 2 chars: "[ "
-        var currentX = 2; // Start after "[ "
-        
+        // Per-option chips of width (1 + label + 1) tiled left to right
+        // with no separator. Padding cells are part of the chip's hit
+        // region, so the entire strip is clickable.
+        var currentX = 0;
+
         for (int i = 0; i < Options.Count; i++)
         {
-            var optionWidth = Options[i].Length;
-            var endX = currentX + optionWidth;
-            
+            var chipWidth = Options[i].Length + 2;
+            var endX = currentX + chipWidth; // exclusive
+
             if (localX >= currentX && localX < endX)
             {
                 SelectedIndex = i;
                 MarkDirty();
                 return InputResult.Handled;
             }
-            
-            // Move past this option and the separator " | " (3 chars)
-            currentX = endX + 3;
+
+            currentX = endX;
         }
-        
+
         return InputResult.NotHandled;
     }
 
@@ -185,20 +196,13 @@ public sealed class ToggleSwitchNode : Hex1bNode
             return constraints.Constrain(new Size(0, 1));
         }
 
-        // Calculate total width: each option + separators
-        // Format: "[ Option1 | Option2 | Option3 ]" or "< Option1 | Option2 | Option3 >"
-        // Each option has padding around it, separators between options
-        // Left bracket (2) + options with padding + separators + right bracket (2)
-        var totalWidth = 2; // left bracket + space
+        // Per-option chips of width (1 + label + 1) tiled with no
+        // separator. Total width = Σ(label_len + 2) = Σlabel_len + 2n.
+        var totalWidth = 0;
         for (int i = 0; i < Options.Count; i++)
         {
-            totalWidth += Options[i].Length;
-            if (i < Options.Count - 1)
-            {
-                totalWidth += 3; // " | " separator
-            }
+            totalWidth += Options[i].Length + 2;
         }
-        totalWidth += 2; // space + right bracket
 
         return constraints.Constrain(new Size(totalWidth, 1));
     }
@@ -206,97 +210,55 @@ public sealed class ToggleSwitchNode : Hex1bNode
     public override void Render(Hex1bRenderContext context)
     {
         var theme = context.Theme;
-        
+
         if (Options.Count == 0)
         {
             return;
         }
 
-        // Get theme values
-        var leftBracket = theme.Get(ToggleSwitchTheme.LeftBracket);
-        var rightBracket = theme.Get(ToggleSwitchTheme.RightBracket);
-        var separator = theme.Get(ToggleSwitchTheme.Separator);
         var focusedSelectedFg = theme.Get(ToggleSwitchTheme.FocusedSelectedForegroundColor);
         var focusedSelectedBg = theme.Get(ToggleSwitchTheme.FocusedSelectedBackgroundColor);
         var unfocusedSelectedFg = theme.Get(ToggleSwitchTheme.UnfocusedSelectedForegroundColor);
         var unfocusedSelectedBg = theme.Get(ToggleSwitchTheme.UnfocusedSelectedBackgroundColor);
         var unselectedFg = theme.Get(ToggleSwitchTheme.UnselectedForegroundColor);
         var unselectedBg = theme.Get(ToggleSwitchTheme.UnselectedBackgroundColor);
-        var focusedBracketFg = theme.Get(ToggleSwitchTheme.FocusedBracketForegroundColor);
-        var focusedBracketBg = theme.Get(ToggleSwitchTheme.FocusedBracketBackgroundColor);
-        var unfocusedBracketFg = theme.Get(ToggleSwitchTheme.UnfocusedBracketForegroundColor);
-        var unfocusedBracketBg = theme.Get(ToggleSwitchTheme.UnfocusedBracketBackgroundColor);
 
         var resetToGlobal = theme.GetResetToGlobalCodes();
         var globalColors = theme.GetGlobalColorCodes();
 
-        // Build the output string
         var output = new System.Text.StringBuilder();
 
-        // Render left bracket with focus-dependent styling
-        if (IsFocused)
-        {
-            var bracketFgCode = focusedBracketFg.IsDefault ? "" : focusedBracketFg.ToForegroundAnsi();
-            var bracketBgCode = focusedBracketBg.IsDefault ? "" : focusedBracketBg.ToBackgroundAnsi();
-            output.Append($"{bracketFgCode}{bracketBgCode}{leftBracket}{resetToGlobal}");
-        }
-        else
-        {
-            var bracketFgCode = unfocusedBracketFg.IsDefault ? globalColors : unfocusedBracketFg.ToForegroundAnsi();
-            var bracketBgCode = unfocusedBracketBg.IsDefault ? "" : unfocusedBracketBg.ToBackgroundAnsi();
-            output.Append($"{bracketFgCode}{bracketBgCode}{leftBracket}{resetToGlobal}");
-        }
-
-        // Render each option
         for (int i = 0; i < Options.Count; i++)
         {
             var isSelected = i == SelectedIndex;
-            var option = Options[i];
+            var label = Options[i];
 
+            Hex1bColor fg;
+            Hex1bColor bg;
             if (isSelected && IsFocused)
             {
-                // Selected option when focused: use focused selected colors (bright highlight)
-                var fgCode = focusedSelectedFg.IsDefault ? "" : focusedSelectedFg.ToForegroundAnsi();
-                var bgCode = focusedSelectedBg.IsDefault ? "" : focusedSelectedBg.ToBackgroundAnsi();
-                output.Append($"{fgCode}{bgCode}{option}{resetToGlobal}");
+                fg = focusedSelectedFg;
+                bg = focusedSelectedBg;
             }
             else if (isSelected)
             {
-                // Selected option when unfocused: use unfocused selected colors (subtle highlight)
-                var fgCode = unfocusedSelectedFg.IsDefault ? globalColors : unfocusedSelectedFg.ToForegroundAnsi();
-                var bgCode = unfocusedSelectedBg.IsDefault ? "" : unfocusedSelectedBg.ToBackgroundAnsi();
-                output.Append($"{fgCode}{bgCode}{option}{resetToGlobal}");
+                fg = unfocusedSelectedFg;
+                bg = unfocusedSelectedBg;
             }
             else
             {
-                // Unselected option: use unselected colors or global
-                var fgCode = unselectedFg.IsDefault ? globalColors : unselectedFg.ToForegroundAnsi();
-                var bgCode = unselectedBg.IsDefault ? "" : unselectedBg.ToBackgroundAnsi();
-                output.Append($"{fgCode}{bgCode}{option}{resetToGlobal}");
+                fg = unselectedFg;
+                bg = unselectedBg;
             }
 
-            // Add separator between options
-            if (i < Options.Count - 1)
-            {
-                output.Append($"{globalColors}{separator}{resetToGlobal}");
-            }
+            var fgCode = fg.IsDefault ? globalColors : fg.ToForegroundAnsi();
+            var bgCode = bg.IsDefault ? "" : bg.ToBackgroundAnsi();
+
+            // Each chip is " label " — leading pad, label, trailing pad —
+            // all painted in this option's colours.
+            output.Append($"{fgCode}{bgCode} {label} {resetToGlobal}");
         }
 
-        // Render right bracket with focus-dependent styling
-        if (IsFocused)
-        {
-            var bracketFgCode = focusedBracketFg.IsDefault ? "" : focusedBracketFg.ToForegroundAnsi();
-            var bracketBgCode = focusedBracketBg.IsDefault ? "" : focusedBracketBg.ToBackgroundAnsi();
-            output.Append($"{bracketFgCode}{bracketBgCode}{rightBracket}{resetToGlobal}");
-        }
-        else
-        {
-            var bracketFgCode = unfocusedBracketFg.IsDefault ? globalColors : unfocusedBracketFg.ToForegroundAnsi();
-            var bracketBgCode = unfocusedBracketBg.IsDefault ? "" : unfocusedBracketBg.ToBackgroundAnsi();
-            output.Append($"{bracketFgCode}{bracketBgCode}{rightBracket}{resetToGlobal}");
-        }
-
-        // Write to context
         if (context.CurrentLayoutProvider != null)
         {
             context.WriteClipped(Bounds.X, Bounds.Y, output.ToString());

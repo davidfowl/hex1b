@@ -24,9 +24,8 @@ public class ToggleSwitchNodeTests
 
         var size = node.Measure(Constraints.Unbounded);
 
-        // "< Manual | Auto | Delayed >" 
-        // = 2 (< ) + 6 (Manual) + 3 ( | ) + 4 (Auto) + 3 ( | ) + 7 (Delayed) + 2 ( >) = 27
-        Assert.Equal(27, size.Width);
+        // Per-option chips: " Manual " (8) + " Auto " (6) + " Delayed " (9) = 23
+        Assert.Equal(23, size.Width);
         Assert.Equal(1, size.Height);
     }
 
@@ -54,8 +53,8 @@ public class ToggleSwitchNodeTests
 
         var size = node.Measure(Constraints.Unbounded);
 
-        // "< Only >" = 2 + 4 + 2 = 8
-        Assert.Equal(8, size.Width);
+        // " Only " = 1 + 4 + 1 = 6
+        Assert.Equal(6, size.Width);
         Assert.Equal(1, size.Height);
     }
 
@@ -69,8 +68,8 @@ public class ToggleSwitchNodeTests
 
         var size = node.Measure(Constraints.Unbounded);
 
-        // "< On | Off >" = 2 + 2 + 3 + 3 + 2 = 12
-        Assert.Equal(12, size.Width);
+        // " On " (4) + " Off " (5) = 9
+        Assert.Equal(9, size.Width);
         Assert.Equal(1, size.Height);
     }
 
@@ -214,6 +213,80 @@ public class ToggleSwitchNodeTests
         var exception = Record.Exception(() => node.Render(context));
 
         Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task Render_UnselectedOption_PaintsUnselectedBackground()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 5).Build();
+        var context = new Hex1bRenderContext(workload);
+        var node = new ToggleSwitchNode
+        {
+            Options = ["On", "Off"],
+            SelectedIndex = 0,
+            IsFocused = false
+        };
+        // Layout: " On " (chip 0, cells 0-3) + " Off " (chip 1, cells 4-8) = 9 cells
+        node.Arrange(new Rect(0, 0, 9, 1));
+        node.Render(context);
+
+        var snapshot = await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("On") && s.ContainsText("Off"), TimeSpan.FromSeconds(5), "options visible")
+            .Capture("final")
+            .Build()
+            .ApplyWithCaptureAsync(terminal, TestContext.Current.CancellationToken);
+
+        var expectedUnselectedBg = context.Theme.Get(ToggleSwitchTheme.UnselectedBackgroundColor);
+        // Chip 1 ("Off") is unselected — every cell of the chip should
+        // sit on the unselected background.
+        for (var x = 4; x <= 8; x++)
+        {
+            Assert.Equal(expectedUnselectedBg, snapshot.GetCell(x, 0).Background);
+        }
+        Assert.Equal("O", snapshot.GetCell(5, 0).Character);
+        Assert.Equal("f", snapshot.GetCell(6, 0).Character);
+        Assert.Equal("f", snapshot.GetCell(7, 0).Character);
+    }
+
+    [Fact]
+    public async Task Render_FocusedSelectedOption_PaintsFocusedSelectedBackground()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 5).Build();
+        var context = new Hex1bRenderContext(workload);
+        var node = new ToggleSwitchNode
+        {
+            Options = ["On", "Off"],
+            SelectedIndex = 0,
+            IsFocused = true
+        };
+        // Layout: " On " (chip 0, cells 0-3, selected) + " Off " (chip 1, cells 4-8)
+        node.Arrange(new Rect(0, 0, 9, 1));
+        node.Render(context);
+
+        var snapshot = await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("On") && s.ContainsText("Off"), TimeSpan.FromSeconds(5), "options visible")
+            .Capture("final")
+            .Build()
+            .ApplyWithCaptureAsync(terminal, TestContext.Current.CancellationToken);
+
+        var expectedSelectedBg = context.Theme.Get(ToggleSwitchTheme.FocusedSelectedBackgroundColor);
+        var expectedUnselectedBg = context.Theme.Get(ToggleSwitchTheme.UnselectedBackgroundColor);
+
+        // Chip 0 ("On", selected, focused) — every cell sits on the focused selected background.
+        for (var x = 0; x <= 3; x++)
+        {
+            Assert.Equal(expectedSelectedBg, snapshot.GetCell(x, 0).Background);
+        }
+        Assert.Equal("O", snapshot.GetCell(1, 0).Character);
+        Assert.Equal("n", snapshot.GetCell(2, 0).Character);
+
+        // Chip 1 ("Off", unselected) — sits on the unselected background.
+        for (var x = 4; x <= 8; x++)
+        {
+            Assert.Equal(expectedUnselectedBg, snapshot.GetCell(x, 0).Background);
+        }
     }
 
     #endregion
@@ -576,18 +649,18 @@ public class ToggleSwitchNodeTests
     [Fact]
     public async Task HandleMouseClick_SelectsClickedOption()
     {
-        // Format: "[ Manual | Auto | Delayed ]"
-        // Positions: 0-1="[ ", 2-7="Manual", 8-10=" | ", 11-14="Auto", 15-17=" | ", 18-24="Delayed", 25-26=" ]"
+        // Layout: " Manual  Auto  Delayed " — per-option chips:
+        // 0-7 = " Manual " (chip 0), 8-13 = " Auto " (chip 1), 14-22 = " Delayed " (chip 2)
         var node = new ToggleSwitchNode
         {
             Options = ["Manual", "Auto", "Delayed"]
         };
         node.Measure(Constraints.Unbounded);
-        node.Arrange(new Rect(0, 0, 27, 1));
+        node.Arrange(new Rect(0, 0, 23, 1));
 
-        // Click on "Auto" (local X position within "Auto" range: starts at 11)
-        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 12, 0, Hex1bModifiers.None);
-        var result = node.HandleMouseClick(12, 0, mouseEvent);
+        // Click anywhere inside chip 1 ("Auto", cells 8-13)
+        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 10, 0, Hex1bModifiers.None);
+        var result = node.HandleMouseClick(10, 0, mouseEvent);
 
         Assert.Equal(InputResult.Handled, result);
         Assert.Equal(1, node.SelectedIndex);
@@ -596,35 +669,57 @@ public class ToggleSwitchNodeTests
     [Fact]
     public async Task HandleMouseClick_FirstOption_SelectsIndex0()
     {
+        // Layout: " On  Off " — chip 0 covers cells 0-3, chip 1 covers cells 4-8
         var node = new ToggleSwitchNode
         {
             Options = ["On", "Off"],
             SelectedIndex = 1 // Start with second selected
         };
         node.Measure(Constraints.Unbounded);
-        node.Arrange(new Rect(0, 0, 13, 1));
+        node.Arrange(new Rect(0, 0, 9, 1));
 
-        // Click on "On" (starts at X=2)
-        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 3, 0, Hex1bModifiers.None);
-        var result = node.HandleMouseClick(3, 0, mouseEvent);
+        // Click on the "On" chip (any cell in 0-3)
+        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 1, 0, Hex1bModifiers.None);
+        var result = node.HandleMouseClick(1, 0, mouseEvent);
 
         Assert.Equal(InputResult.Handled, result);
         Assert.Equal(0, node.SelectedIndex);
     }
 
     [Fact]
-    public async Task HandleMouseClick_OnBracket_ReturnsNotHandled()
+    public async Task HandleMouseClick_OnLeadingPadding_SelectsFirstOption()
+    {
+        // Padding cells are part of their owning chip, so clicking the
+        // leading padding cell of chip 0 should select option 0.
+        var node = new ToggleSwitchNode
+        {
+            Options = ["On", "Off"],
+            SelectedIndex = 1
+        };
+        node.Measure(Constraints.Unbounded);
+        node.Arrange(new Rect(0, 0, 9, 1));
+
+        // Click on chip 0's leading padding cell (X=0)
+        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 0, 0, Hex1bModifiers.None);
+        var result = node.HandleMouseClick(0, 0, mouseEvent);
+
+        Assert.Equal(InputResult.Handled, result);
+        Assert.Equal(0, node.SelectedIndex);
+    }
+
+    [Fact]
+    public async Task HandleMouseClick_PastLastChip_ReturnsNotHandled()
     {
         var node = new ToggleSwitchNode
         {
             Options = ["On", "Off"]
         };
         node.Measure(Constraints.Unbounded);
-        node.Arrange(new Rect(0, 0, 13, 1));
+        node.Arrange(new Rect(0, 0, 20, 1));
 
-        // Click on the left bracket (X=0 or 1)
-        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 0, 0, Hex1bModifiers.None);
-        var result = node.HandleMouseClick(0, 0, mouseEvent);
+        // Click past the last chip (chip 1 ends at X=8, so X=9+ is outside any chip)
+        var mouseEvent = new Hex1bMouseEvent(MouseButton.Left, MouseAction.Down, 12, 0, Hex1bModifiers.None);
+        var result = node.HandleMouseClick(12, 0, mouseEvent);
 
         Assert.Equal(InputResult.NotHandled, result);
     }

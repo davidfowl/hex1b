@@ -149,10 +149,7 @@ public class ThemingExample(ILogger<ThemingExample> logger) : Hex1bExample
             .Set(ToggleSwitchTheme.FocusedSelectedForegroundColor, Hex1bColor.White)
             .Set(ToggleSwitchTheme.FocusedSelectedBackgroundColor, Hex1bColor.FromRgb(34, 139, 34))
             .Set(ToggleSwitchTheme.UnfocusedSelectedForegroundColor, Hex1bColor.FromRgb(144, 238, 144))
-            .Set(ToggleSwitchTheme.UnfocusedSelectedBackgroundColor, Hex1bColor.FromRgb(17, 70, 17))
-            .Set(ToggleSwitchTheme.FocusedBracketForegroundColor, Hex1bColor.FromRgb(144, 238, 144))
-            .Set(ToggleSwitchTheme.LeftBracket, "♣ ")
-            .Set(ToggleSwitchTheme.RightBracket, " ♣");
+            .Set(ToggleSwitchTheme.UnfocusedSelectedBackgroundColor, Hex1bColor.FromRgb(17, 70, 17));
     }
 
     private static Hex1bTheme CreateNeonTheme()
@@ -161,8 +158,6 @@ public class ThemingExample(ILogger<ThemingExample> logger) : Hex1bExample
             // Buttons
             .Set(ButtonTheme.FocusedForegroundColor, Hex1bColor.Black)
             .Set(ButtonTheme.FocusedBackgroundColor, Hex1bColor.FromRgb(255, 0, 255))
-            .Set(ButtonTheme.LeftBracket, "< ")
-            .Set(ButtonTheme.RightBracket, " >")
             // TextBox
             .Set(TextBoxTheme.CursorForegroundColor, Hex1bColor.Black)
             .Set(TextBoxTheme.CursorBackgroundColor, Hex1bColor.FromRgb(0, 255, 255))
@@ -189,10 +184,6 @@ public class ThemingExample(ILogger<ThemingExample> logger) : Hex1bExample
             .Set(ToggleSwitchTheme.FocusedSelectedForegroundColor, Hex1bColor.Black)
             .Set(ToggleSwitchTheme.FocusedSelectedBackgroundColor, Hex1bColor.FromRgb(0, 255, 255))
             .Set(ToggleSwitchTheme.UnfocusedSelectedForegroundColor, Hex1bColor.FromRgb(0, 255, 255))
-            .Set(ToggleSwitchTheme.UnfocusedSelectedBackgroundColor, Hex1bColor.FromRgb(0, 80, 80))
-            .Set(ToggleSwitchTheme.FocusedBracketForegroundColor, Hex1bColor.FromRgb(255, 0, 255))
-            .Set(ToggleSwitchTheme.LeftBracket, "<< ")
-            .Set(ToggleSwitchTheme.RightBracket, " >>")
-            .Set(ToggleSwitchTheme.Separator, " ║ ");
+            .Set(ToggleSwitchTheme.UnfocusedSelectedBackgroundColor, Hex1bColor.FromRgb(0, 80, 80));
     }
 }

@@ -395,4 +395,120 @@ public class PickerIntegrationTests
         Assert.Equal("Banana", selectedFruit);
         Assert.Equal("Green", selectedColor);
     }
+
+    [Fact]
+    public async Task Picker_StackedPickers_OpenedDropdown_DoesNotBleedSiblingChipBackground()
+    {
+        // Reproduces the bug where a Picker dropdown's transparent inner cells
+        // leak whatever was painted underneath. With two pickers stacked
+        // vertically and the dropdown opened, the user's reported failure
+        // mode is that the SECOND item in the dropdown ("Banana") wears the
+        // resting chip background of the second Picker that sits behind it.
+        //
+        // Reproduction recipe (from the user's screenshot in samples/PickerDemo):
+        //   1. Two pickers separated by a spacer so the second picker chip
+        //      lands at the SAME terminal Y as the second dropdown item
+        //      ("Banana"), not a border row.
+        //   2. Open with DownArrow — picker opens with "Banana" pre-selected
+        //      so the chip behind it is masked by the white selected row.
+        //   3. Press DownArrow again — selection moves to "Cherry". The
+        //      previously-selected "Banana" row loses its white background
+        //      and reveals what's underneath. THIS is the user-visible bug.
+        //
+        // Expectation after fix: every cell that falls inside the dropdown's
+        // bounding box stays painted by the dropdown's BackgroundPanel, even
+        // after the selected row moves away.
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithHex1bApp((app, options) => ctx => new VStackWidget([
+                new PickerWidget(["Apple", "Banana", "Cherry"]),
+                new TextBlockWidget(""),
+                new TextBlockWidget(""),
+                new PickerWidget(["Xenon", "Yttrium", "Zirconium"]),
+            ]))
+            .WithHeadless()
+            .WithDimensions(40, 12)
+            .Build();
+
+        var runTask = terminal.RunAsync(TestContext.Current.CancellationToken);
+
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("Apple ▼") && s.ContainsText("Xenon ▼"),
+                TimeSpan.FromSeconds(5), "both pickers to render")
+            // DownArrow on a closed picker: open with the NEXT item (Banana)
+            // pre-selected — this matches what the user does to trigger the bug.
+            .Down()
+            .WaitUntil(s => s.ContainsText("Apple") && s.ContainsText("Banana") && s.ContainsText("Cherry"),
+                TimeSpan.FromSeconds(5), "first picker dropdown to open with Banana selected")
+            // Move selection from Banana to Cherry. Banana's row now has to be
+            // re-painted as overlay background instead of the selected white.
+            .Down()
+            .WaitUntil(s => s.GetText().Contains("> Cherry"),
+                TimeSpan.FromSeconds(2), "selection moved to Cherry")
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        using var snapshot = terminal.CreateSnapshot();
+
+        // Locate the dropdown by finding the popup-side "Banana" cell — the
+        // one NOT on row 1 (which is where the second picker's "Xenon ▼" sits).
+        (int Line, int Column)? popupBanana = null;
+        foreach (var match in snapshot.FindText("Banana"))
+        {
+            if (match.Line >= 2)
+            {
+                popupBanana = match;
+                break;
+            }
+        }
+        Assert.True(popupBanana.HasValue,
+            $"Expected to find Banana inside the popup body.\nScreen:\n{snapshot.GetText()}");
+
+        // The dropdown wraps a ListWidget in a BorderWidget. The "Banana"
+        // text starts after the border (col -1) and the unselected indicator
+        // (cols -3..-2). So the popup's left edge is at popupBanana.Column - 3
+        // and its top edge sits one row above whichever item rendered first
+        // in the popup ("Apple" at popupBanana.Line - 1, then border at
+        // popupBanana.Line - 2).
+        var popupLeft = popupBanana.Value.Column - 3;
+        var popupTop = popupBanana.Value.Line - 2;
+
+        // Resolve the colour we expect NOT to see anywhere inside the popup
+        // bounding box. With the default theme this is the resting Picker
+        // chip background — rgb(60, 60, 60) — that was painted by the
+        // second picker before the dropdown rendered on top of it.
+        var theme = Hex1b.Theming.Hex1bThemes.Default;
+        var siblingChipBg = theme.Get(Hex1b.Theming.ButtonTheme.BackgroundColor);
+
+        // Walk the dropdown's full bounding box (border + items + bottom
+        // border). Anything wearing the sibling picker's chip colour means
+        // a cell wasn't painted by the popup.
+        var leakedCells = new List<(int X, int Y, Hex1b.Theming.Hex1bColor? Bg)>();
+        for (int y = popupTop; y < popupTop + 5; y++)
+        {
+            for (int x = popupLeft; x < popupLeft + 12; x++)
+            {
+                if (x < 0 || y < 0 || x >= snapshot.Width || y >= snapshot.Height)
+                {
+                    continue;
+                }
+                var bg = snapshot.GetCell(x, y).Background;
+                if (bg.HasValue && bg.Value.Equals(siblingChipBg))
+                {
+                    leakedCells.Add((x, y, bg));
+                }
+            }
+        }
+
+        await new Hex1bTerminalInputSequenceBuilder()
+            .Ctrl().Key(Hex1bKey.C)
+            .Build()
+            .ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        await runTask;
+
+        Assert.True(
+            leakedCells.Count == 0,
+            $"Sibling picker chip background ({siblingChipBg}) bled through the open dropdown at {leakedCells.Count} cell(s): " +
+            string.Join(", ", leakedCells.Take(10).Select(c => $"({c.X},{c.Y})")) +
+            $".\nScreen:\n{snapshot.GetText()}");
+    }
 }
