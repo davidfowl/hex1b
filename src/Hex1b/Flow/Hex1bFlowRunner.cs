@@ -1,6 +1,7 @@
 using System.Text;
 using Hex1b.Input;
 using Hex1b.Layout;
+using Hex1b.Surfaces;
 using Hex1b.Theming;
 using Hex1b.Widgets;
 
@@ -16,7 +17,16 @@ internal sealed class Hex1bFlowRunner
     private readonly Hex1bFlowOptions _options;
     private readonly IHex1bAppTerminalWorkloadAdapter _parentAdapter;
 
-    // Current cursor row in the terminal buffer (0-based, relative to terminal top)
+    /// <summary>
+    /// Current cursor row in the terminal buffer (0-based, relative to terminal top).
+    /// Tracks where the next yield widget or step should be rendered. After a
+    /// soft-wrap tombstone is emitted, this becomes the row immediately past
+    /// the last emitted line (capped to the bottom of the viewport when the
+    /// terminal had to scroll). After a resize on the soft-wrap path, this is
+    /// re-anchored to the top of the bottom-aligned active-step region so the
+    /// next tombstone (when the active step completes) lands directly in the
+    /// step's place.
+    /// </summary>
     private int _cursorRow;
 
     // The currently active step, if any. Only one step may run at a time.
@@ -24,6 +34,47 @@ internal sealed class Hex1bFlowRunner
 
     // CancellationToken from RunAsync, surfaced to flow callbacks via Hex1bFlowContext.
     private CancellationToken _cancellationToken;
+
+    // DEC private mode 2026 (Synchronized Update Mode). Wrapping the
+    // resize-time clear-and-redraw in BSU/ESU lets supporting terminals
+    // present the whole repaint as a single atomic frame, eliminating any
+    // brief blank flash between clearing the old step region and the step
+    // app re-rendering into the new one. Terminals that don't recognise
+    // mode 2026 ignore both sequences.
+    private const string SyncUpdateBegin = "\x1b[?2026h";
+    private const string SyncUpdateEnd = "\x1b[?2026l";
+
+    // Diagnostic trace gated on the HEX1B_FLOW_TRACE environment variable.
+    // When set to a writable file path, every interesting state transition
+    // (tombstone emission, pre-scroll, resize handling) is appended to
+    // that file. Used to investigate visual artefacts like duplicate
+    // tombstones on resize. The path is read once at process start.
+    private static readonly string? TraceLogPath = Environment.GetEnvironmentVariable("HEX1B_FLOW_TRACE");
+    private static readonly object TraceLock = new();
+    private static int _resizeCounter;
+    private static int _emitCounter;
+
+    // Always callable; becomes a near-zero-cost no-op when the env var is
+    // unset (one nullable field read, one early return). Not gated on
+    // [Conditional("DEBUG")] so users can capture traces from a Release-mode
+    // build of FlowDemo without a special rebuild.
+    private static void Trace(string message)
+    {
+        var path = TraceLogPath;
+        if (string.IsNullOrEmpty(path)) return;
+        lock (TraceLock)
+        {
+            try
+            {
+                File.AppendAllText(path, $"[{DateTime.UtcNow:HH:mm:ss.fff}] {message}{Environment.NewLine}");
+            }
+            catch
+            {
+                // Diagnostic logging is best-effort; never let a trace write
+                // disrupt the flow.
+            }
+        }
+    }
 
     public Hex1bFlowRunner(
         Func<Hex1bFlowContext, Task> flowCallback,
@@ -63,11 +114,17 @@ internal sealed class Hex1bFlowRunner
     {
         _cancellationToken = ct;
 
-        // Query the current cursor position using DSR (Device Status Report)
-        _cursorRow = await QueryCursorRowAsync(ct);
+        // Query the current cursor position using the host terminal's
+        // synchronous cursor API (when available). Falls back to
+        // InitialCursorRow or 0 when no live query is wired.
+        _cursorRow = await QueryCursorRowAsync(ct) ?? _options.InitialCursorRow ?? 0;
+
+        Trace($"RunAsync start: termSize={_parentAdapter.Width}x{_parentAdapter.Height} cursorRow={_cursorRow} useSoftWrap={_options.UseSoftWrapTombstones}");
 
         var context = new Hex1bFlowContext(this);
         await _flowCallback(context);
+
+        Trace($"RunAsync end: cursorRow={_cursorRow}");
 
         // After flow completes, position cursor below the last yield widget
         _parentAdapter.SetCursorPosition(0, _cursorRow);
@@ -101,6 +158,20 @@ internal sealed class Hex1bFlowRunner
 
         // Clear and render
         ClearRegion(_cursorRow, contentHeight);
+        if (_options.UseSoftWrapTombstones)
+        {
+            // Render the static content into a surface and emit it as
+            // soft-wrap-friendly logical lines so the host terminal owns
+            // the reflow/scroll behaviour for the lifetime of the flow.
+            var surface = RenderToSurface(builder, terminalWidth, contentHeight);
+            if (surface is not null)
+            {
+                EmitSoftWrapTombstone(surface);
+                return;
+            }
+            // Fall through to legacy path if surface rendering failed.
+        }
+
         var renderedHeight = await RenderYieldWidgetAsync(builder, terminalWidth, contentHeight);
         _cursorRow += renderedHeight;
     }
@@ -223,6 +294,14 @@ internal sealed class Hex1bFlowRunner
                 WorkloadAdapter = stepAdapter,
                 EnableMouse = options?.EnableMouse ?? false,
                 EnableDefaultCtrlCExit = true,
+                // On the soft-wrap path the active step is rendered as
+                // logical lines (text + ESC[K + CR+LF) instead of as a
+                // CUP-positioned cell diff. This makes the step content
+                // reflowable by the host terminal alongside any
+                // tombstones above it, so a horizontal resize doesn't
+                // leave wrap-spillover ghost cells around the new step
+                // region.
+                UseSoftWrapEmission = _options.UseSoftWrapTombstones,
             };
 
             if (_options.Theme != null)
@@ -239,18 +318,45 @@ internal sealed class Hex1bFlowRunner
             var inputPumpTask = PumpStepInputAsync(stepAdapter, inputPumpCts.Token,
                 onResize: (newWidth, newHeight) =>
                 {
-                    var newStepHeight = Math.Min(options?.MaxHeight ?? newHeight, newHeight);
-                    if (newStepHeight < 1) newStepHeight = 1;
+                    var newStepHeight = FlowResizeMath.ComputeStepHeight(options?.MaxHeight, newHeight);
+                    Trace($"onResize: newSize={newWidth}x{newHeight} newStepH={newStepHeight} useSoftWrap={_options.UseSoftWrapTombstones}");
 
-                    var newRowOrigin = Math.Max(0, newHeight - newStepHeight);
+                    if (_options.UseSoftWrapTombstones)
+                    {
+                        // Resize strategy: push everything currently visible
+                        // up off the top of the viewport into the host
+                        // terminal's scrollback (where it will appear
+                        // soft-wrapped because tombstones were emitted as
+                        // logical lines), then clear the viewport and
+                        // re-anchor the active step at row 0. This avoids
+                        // any visual mangling from cell-positioned step
+                        // content trying to coexist with reflowed
+                        // tombstones at unpredictable rows.
+                        ScrollViewportToScrollback(newHeight);
 
-                    ClearRegion(0, newHeight);
+                        stepAdapter.RowOrigin = 0;
+                        rowOrigin = 0;
+                        _cursorRow = 0;
+                        desiredHeight = newStepHeight;
+                        step.StepHeight = newStepHeight;
+                    }
+                    else
+                    {
+                        // Legacy path: cell-positioned tombstones can't be
+                        // preserved across reflow, so we wipe the whole visible
+                        // area and bottom-anchor the new step.
+                        var (clearOrigin, clearHeight) = FlowResizeMath.ComputeClearRegion(
+                            useSoftWrapTombstones: false, newHeight, newStepHeight);
+                        var newRowOrigin = Math.Max(0, newHeight - newStepHeight);
 
-                    stepAdapter.RowOrigin = newRowOrigin;
-                    rowOrigin = newRowOrigin;
-                    _cursorRow = newRowOrigin;
-                    desiredHeight = newStepHeight;
-                    step.StepHeight = newStepHeight;
+                        ClearRegion(clearOrigin, clearHeight);
+
+                        stepAdapter.RowOrigin = newRowOrigin;
+                        rowOrigin = newRowOrigin;
+                        _cursorRow = newRowOrigin;
+                        desiredHeight = newStepHeight;
+                        step.StepHeight = newStepHeight;
+                    }
 
                     _ = stepAdapter.ResizeAsync(newWidth, newStepHeight);
                 });
@@ -283,8 +389,26 @@ internal sealed class Hex1bFlowRunner
             var completedBuilder = step.CompletedBuilder;
             if (completedBuilder != null)
             {
-                var completedHeight = await RenderYieldWidgetAsync(completedBuilder, terminalWidth, desiredHeight);
-                _cursorRow += completedHeight;
+                if (_options.UseSoftWrapTombstones)
+                {
+                    var surface = RenderToSurface(completedBuilder, terminalWidth, desiredHeight);
+                    if (surface is not null)
+                    {
+                        EmitSoftWrapTombstone(surface);
+                        Trace("Step completed: tombstone emitted (append-only, terminal owns reflow)");
+                    }
+                    else
+                    {
+                        // Fall back to the legacy path if surface rendering failed.
+                        var completedHeight = await RenderYieldWidgetAsync(completedBuilder, terminalWidth, desiredHeight);
+                        _cursorRow += completedHeight;
+                    }
+                }
+                else
+                {
+                    var completedHeight = await RenderYieldWidgetAsync(completedBuilder, terminalWidth, desiredHeight);
+                    _cursorRow += completedHeight;
+                }
             }
 
             _activeStep = null;
@@ -522,6 +646,180 @@ internal sealed class Hex1bFlowRunner
     }
 
     /// <summary>
+    /// Renders a yield builder into a freshly-allocated <see cref="Surface"/>.
+    /// Returns <c>null</c> if reconciliation, measurement, or rendering fails
+    /// — callers should fall back to the legacy emission path in that case.
+    /// </summary>
+    /// <remarks>
+    /// Used only on the soft-wrap tombstone path
+    /// (<see cref="Hex1bFlowOptions.UseSoftWrapTombstones"/>). The surface is
+    /// sized to <paramref name="width"/> by the widget's measured height
+    /// (clamped to <paramref name="maxHeight"/> × 10 to bound page-by-page
+    /// content). The surface is then arranged and rendered using the standard
+    /// rendering pipeline so any widget that works on screen will work here.
+    /// </remarks>
+    private Surface? RenderToSurface(
+        Func<RootContext, Hex1bWidget> builder,
+        int width,
+        int maxHeight)
+    {
+        try
+        {
+            var rootCtx = new RootContext();
+            var widget = builder(rootCtx);
+            if (widget == null) return null;
+
+            var reconcileCtx = ReconcileContext.CreateRoot();
+            var nodeTask = widget.ReconcileAsync(null, reconcileCtx);
+            // Reconciliation should complete synchronously for the widgets
+            // used in flow tombstones today; if it doesn't, defer to the
+            // legacy renderer which has its own measurement fallback.
+            if (!nodeTask.IsCompleted) return null;
+
+            var node = nodeTask.Result;
+            if (node == null) return null;
+
+            // Measure with a generous height bound so multi-line tombstones
+            // get their full height, then clamp to a safety ceiling so a
+            // misbehaving widget can't allocate an unbounded surface.
+            var measureMax = Math.Max(maxHeight * 10, maxHeight);
+            var constraints = new Constraints(0, width, 0, measureMax);
+            var measured = node.Measure(constraints);
+            var height = Math.Max(1, Math.Min(measured.Height, measureMax));
+
+            var surface = new Surface(width, height);
+            node.Arrange(new Rect(0, 0, width, height));
+
+            var renderCtx = new SurfaceRenderContext(surface, _options.Theme);
+            renderCtx.SetCapabilities(_parentAdapter.Capabilities);
+            node.Render(renderCtx);
+
+            return surface;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Emits the contents of <paramref name="surface"/> as a tombstone via
+    /// <see cref="SoftWrapEmitter"/>, pre-scrolling the terminal as needed so
+    /// the emission fits in the visible area, and updating <see cref="_cursorRow"/>
+    /// to point at the row directly below the tombstone.
+    /// </summary>
+    private void EmitSoftWrapTombstone(Surface surface)
+    {
+        var emitId = Interlocked.Increment(ref _emitCounter);
+        var height = surface.Height;
+        var terminalHeight = _parentAdapter.Height;
+
+        Trace($"EmitSoftWrapTombstone[#{emitId}] enter: surfaceSize={surface.Width}x{height} cursorRow={_cursorRow} termH={terminalHeight}");
+
+        // Pre-scroll the viewport if there isn't enough room below the cursor
+        // for the tombstone. We use the same trick as the legacy paths
+        // (writing newlines at the bottom row) which causes the terminal to
+        // scroll the existing content up — including any older tombstones,
+        // which is the desired behaviour.
+        var overflow = (_cursorRow + height) - terminalHeight;
+        if (overflow > 0)
+        {
+            _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
+            for (int i = 0; i < overflow; i++)
+            {
+                _parentAdapter.Write("\n");
+            }
+            _cursorRow -= overflow;
+            Trace($"EmitSoftWrapTombstone[#{emitId}] pre-scroll: overflow={overflow} -> cursorRow={_cursorRow}");
+        }
+
+        // Position the cursor at the row where the tombstone should land.
+        _parentAdapter.SetCursorPosition(0, _cursorRow);
+
+        SoftWrapEmitter.Emit(surface, _parentAdapter);
+
+        // The emitter terminates rows 0 .. height-2 with CR + LF (each
+        // advances the cursor down one row, with no scrolling because we
+        // pre-scrolled above to guarantee the last row lands at or above the
+        // bottom of the viewport). The final row deliberately has no trailing
+        // newline so emitting a tombstone at the very bottom does not scroll
+        // the content one row up — visually the tombstone freezes in place
+        // exactly where the step was. The terminal cursor therefore ends up
+        // at (last-row-content-column, _cursorRow + height - 1); for our
+        // bookkeeping we want _cursorRow to point at the row immediately
+        // *below* the last visible tombstone row, so the next render lands
+        // there cleanly.
+        _cursorRow += height;
+
+        Trace($"EmitSoftWrapTombstone[#{emitId}] exit: cursorRow={_cursorRow}");
+    }
+
+    /// <summary>
+    /// Pushes the entire current viewport contents up off the top of the
+    /// screen and into the host terminal's scrollback buffer, then clears
+    /// the viewport. Used by the soft-wrap resize handler so the active
+    /// step (which uses absolute cursor positioning) can be cleanly
+    /// re-anchored at row 0 without competing with reflowed tombstone
+    /// content from the previous viewport.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Tombstones above the active step were emitted as soft-wrap-friendly
+    /// logical lines, so once they are scrolled into scrollback the host
+    /// terminal renders them with proper word wrap at the new width.
+    /// Cell-positioned step content cannot reflow that way, so we just
+    /// scroll it away and let the step app repaint at the new size.
+    /// </para>
+    /// <para>
+    /// Mechanism: park cursor at the bottom row, write <paramref name="newHeight"/>
+    /// linefeeds. Each LF at the bottom row scrolls the viewport up by one
+    /// row (pushing the top row into scrollback), so writing a full
+    /// viewport-height worth of LFs guarantees every previously-visible
+    /// row ends up in scrollback. Then position cursor at home and clear
+    /// from there to end of screen — this leaves a fully blank viewport
+    /// with cursor at (0,0), ready for the step to re-render.
+    /// </para>
+    /// <para>
+    /// Bracketed in DEC private mode 2026 (Synchronized Update Mode) so
+    /// supporting terminals present the scroll+clear as one atomic frame.
+    /// Terminals that ignore mode 2026 see a brief flash but no
+    /// functional regression.
+    /// </para>
+    /// </remarks>
+    private void ScrollViewportToScrollback(int newHeight)
+    {
+        var resizeId = Interlocked.Increment(ref _resizeCounter);
+        Trace($"ScrollViewportToScrollback[#{resizeId}] enter: newHeight={newHeight}");
+
+        _parentAdapter.Write(SyncUpdateBegin);
+        try
+        {
+            // Park at bottom-left and emit one LF per viewport row. Each
+            // LF at the bottom scrolls the viewport up by one row, moving
+            // the top line into scrollback. After newHeight LFs every
+            // previously-visible row has been pushed into scrollback.
+            _parentAdapter.SetCursorPosition(0, newHeight - 1);
+            var sb = new StringBuilder(newHeight);
+            for (int i = 0; i < newHeight; i++)
+            {
+                sb.Append('\n');
+            }
+            _parentAdapter.Write(sb.ToString());
+
+            // Home + clear-to-end-of-screen. After scrolling, the cursor
+            // may be anywhere; reset to top-left and wipe so the step can
+            // render from a known-blank canvas.
+            _parentAdapter.Write("\x1b[1;1H\x1b[J");
+        }
+        finally
+        {
+            _parentAdapter.Write(SyncUpdateEnd);
+        }
+
+        Trace($"ScrollViewportToScrollback[#{resizeId}] exit");
+    }
+
+    /// <summary>
     /// Pumps output from a step adapter to the parent adapter.
     /// </summary>
     private async Task PumpStepOutputAsync(InlineStepAdapter stepAdapter, CancellationToken ct)
@@ -570,13 +868,30 @@ internal sealed class Hex1bFlowRunner
     }
 
     /// <summary>
-    /// Queries the current cursor row position using Device Status Report (DSR).
-    /// Falls back to bottom of terminal if query fails.
+    /// Queries the host terminal's current cursor row (0-based). Uses the
+    /// <see cref="Hex1bFlowOptions.CursorRowProvider"/> delegate when set so
+    /// the runner can read the post-reflow position of the parked cursor
+    /// after a horizontal resize. Falls back to
+    /// <see cref="Hex1bFlowOptions.InitialCursorRow"/> when no provider is
+    /// available (headless/test scenarios).
     /// </summary>
-    private Task<int> QueryCursorRowAsync(CancellationToken ct)
+    private Task<int?> QueryCursorRowAsync(CancellationToken ct)
     {
-        // Use the initial cursor row from options if provided
-        return Task.FromResult(_options.InitialCursorRow ?? 0);
+        if (_options.CursorRowProvider is { } provider)
+        {
+            try
+            {
+                return Task.FromResult(provider());
+            }
+            catch
+            {
+                // Provider failures collapse to "unavailable" so callers
+                // can fall back to bottom-anchor behaviour.
+                return Task.FromResult<int?>(null);
+            }
+        }
+
+        return Task.FromResult<int?>(_options.InitialCursorRow);
     }
 }
 
@@ -601,4 +916,56 @@ public sealed class Hex1bFlowOptions
     /// If null, defaults to 0.
     /// </summary>
     public int? InitialCursorRow { get; set; }
+
+    /// <summary>
+    /// Optional delegate that returns the host terminal's current cursor row
+    /// (0-based). When set, the flow runner uses this to read the initial
+    /// cursor position at startup, before the input pump is running.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Implemented on top of <c>Console.GetCursorPosition()</c> by
+    /// <c>Hex1bTerminalBuilder.WithHex1bFlow</c> when a presentation adapter
+    /// is available. On Windows this resolves through Win32
+    /// <c>GetConsoleScreenBufferInfo</c> (no DSR roundtrip); on Unix the BCL
+    /// uses a raw DSR query that reads the response from stdin.
+    /// </para>
+    /// <para>
+    /// <strong>Must not be called from within a resize handler.</strong>
+    /// On Unix, calling this while Hex1b's input pump is running causes a
+    /// deadlock: the DSR response arrives on the same stdin file descriptor
+    /// that the input pump owns, so <c>Console.GetCursorPosition()</c>
+    /// blocks forever waiting for bytes it will never receive.
+    /// </para>
+    /// <para>
+    /// Returns <c>null</c> to indicate the cursor row could not be
+    /// determined.
+    /// </para>
+    /// </remarks>
+    public Func<int?>? CursorRowProvider { get; set; }
+
+    /// <summary>
+    /// When <c>true</c>, tombstoned (yield) widget output is emitted as
+    /// soft-wrap-friendly logical lines (text + <c>ESC[K</c> + LF) so the host
+    /// terminal can reflow tombstones during a resize and scroll older
+    /// tombstones into the scrollback buffer naturally. When <c>false</c>
+    /// (the default), tombstones are emitted with absolute cursor positioning
+    /// and the entire visible area is cleared on every resize, which causes
+    /// tombstones to disappear when the terminal is resized.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This option is experimental and gates two related behaviours together:
+    /// the tombstone emission path and the resize handler. The new resize
+    /// handler only clears the active step region and trusts the host
+    /// terminal to have reflowed tombstones above it — that is only a valid
+    /// assumption when tombstones were emitted as proper logical lines, so
+    /// both behaviours move together under this single flag.
+    /// </para>
+    /// <para>
+    /// Once validated across the supported terminal matrix this will become
+    /// the default and the legacy cell-positioning path will be removed.
+    /// </para>
+    /// </remarks>
+    public bool UseSoftWrapTombstones { get; set; }
 }

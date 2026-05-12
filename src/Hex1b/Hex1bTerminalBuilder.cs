@@ -882,6 +882,32 @@ public sealed class Hex1bTerminalBuilder
             // This must happen before raw mode is entered (i.e., at Build() time).
             options.InitialCursorRow ??= presentation?.GetCursorPosition().Row ?? 0;
 
+            // Wire a live cursor query so the runner can read the current
+            // cursor position at startup (before the input pump begins).
+            // IMPORTANT: on Unix, Console.GetCursorPosition() sends ESC[6n
+            // and reads the response from stdin. It must NOT be called from
+            // within the resize handler because Hex1b's input pump owns stdin
+            // in a background loop — calling it there deadlocks the terminal.
+            // The CursorRowProvider is therefore only used at RunAsync startup,
+            // before the input pump is running. Returns null when presentation
+            // is null (headless/test scenarios) so the runner falls back to
+            // bottom-anchor.
+            if (presentation != null)
+            {
+                var liveCursor = presentation;
+                options.CursorRowProvider ??= () =>
+                {
+                    try
+                    {
+                        return liveCursor.GetCursorPosition().Row;
+                    }
+                    catch
+                    {
+                        return null;
+                    }
+                };
+            }
+
             var runner = new Flow.Hex1bFlowRunner(flowCallback, options, workloadAdapter);
 
             Func<CancellationToken, Task<int>> runCallback = async ct =>
