@@ -29,6 +29,29 @@ internal sealed class Hex1bFlowRunner
     /// </summary>
     private int _cursorRow;
 
+    /// <summary>
+    /// The row at which the very first tombstone (or the active step, if no
+    /// tombstones have been emitted yet) is anchored. Captured at flow start
+    /// from <see cref="_cursorRow"/> and decremented whenever a tombstone
+    /// emission triggers a pre-scroll (so the anchor tracks "where the top
+    /// of the flow's content currently lives in the viewport"). Combined
+    /// with the per-paragraph widths in <see cref="_emittedTombstones"/>,
+    /// this lets the resize handler compute where the active step should
+    /// land at any new width without round-tripping a CPR query.
+    /// </summary>
+    private int _initialRowOrigin;
+
+    /// <summary>
+    /// Per-tombstone records of paragraph widths (one inner list per
+    /// emitted tombstone, one int per CR+LF-terminated paragraph it
+    /// contained). The host terminal guarantees hard-newline-terminated
+    /// paragraphs are never reflowed across paragraph boundaries, so the
+    /// only thing we need to track to recompute on-screen layout at any
+    /// width is the widths themselves. Used by the soft-wrap settle-mode
+    /// resize handler.
+    /// </summary>
+    private readonly List<IReadOnlyList<int>> _emittedTombstones = new();
+
     // The currently active step, if any. Only one step may run at a time.
     private FlowStep? _activeStep;
 
@@ -118,6 +141,8 @@ internal sealed class Hex1bFlowRunner
         // synchronous cursor API (when available). Falls back to
         // InitialCursorRow or 0 when no live query is wired.
         _cursorRow = await QueryCursorRowAsync(ct) ?? _options.InitialCursorRow ?? 0;
+        _initialRowOrigin = _cursorRow;
+        _emittedTombstones.Clear();
 
         Trace($"RunAsync start: termSize={_parentAdapter.Width}x{_parentAdapter.Height} cursorRow={_cursorRow} useSoftWrap={_options.UseSoftWrapTombstones}");
 
@@ -135,13 +160,13 @@ internal sealed class Hex1bFlowRunner
     /// Renders a static widget as frozen terminal output and advances the cursor.
     /// No interactive step is created — this is a fire-and-forget render.
     /// </summary>
-    internal async Task RenderStaticAsync(Func<RootContext, Hex1bWidget> builder)
+    internal async Task RenderStaticAsync(Func<RootContext, Task<Hex1bWidget>> builder)
     {
         var terminalWidth = _parentAdapter.Width;
         var terminalHeight = _parentAdapter.Height;
 
         // Measure the content to determine how much space it needs
-        var contentHeight = MeasureYieldHeight(builder, terminalWidth, terminalHeight);
+        var contentHeight = await MeasureYieldHeightAsync(builder, terminalWidth, terminalHeight);
         if (contentHeight < 1) contentHeight = 1;
 
         // Scroll if needed to make room
@@ -163,7 +188,7 @@ internal sealed class Hex1bFlowRunner
             // Render the static content into a surface and emit it as
             // soft-wrap-friendly logical lines so the host terminal owns
             // the reflow/scroll behaviour for the lifetime of the flow.
-            var surface = RenderToSurface(builder, terminalWidth, contentHeight);
+            var surface = await RenderToSurfaceAsync(builder, terminalWidth, contentHeight);
             if (surface is not null)
             {
                 EmitSoftWrapTombstone(surface);
@@ -182,7 +207,7 @@ internal sealed class Hex1bFlowRunner
     /// invalidate, complete, and await the step.
     /// </summary>
     internal FlowStep StartStep(
-        Func<FlowStepContext, Hex1bWidget> builder,
+        Func<FlowStepContext, Task<Hex1bWidget>> builder,
         Hex1bFlowStepOptions? options)
     {
         if (_activeStep != null)
@@ -215,7 +240,7 @@ internal sealed class Hex1bFlowRunner
     /// the widget without rendering it.
     /// </summary>
     private int MeasureStepContent(
-        Func<FlowStepContext, Hex1bWidget> builder,
+        Func<FlowStepContext, Task<Hex1bWidget>> builder,
         FlowStep step,
         int width,
         int maxHeight)
@@ -223,7 +248,11 @@ internal sealed class Hex1bFlowRunner
         try
         {
             var stepCtx = new FlowStepContext(step);
-            var widget = builder(stepCtx);
+            var widgetTask = builder(stepCtx);
+            // Synchronous fallback for the measurement pass — see the
+            // RenderToSurface invariant for the rationale.
+            if (!widgetTask.IsCompletedSuccessfully) return maxHeight;
+            var widget = widgetTask.Result;
             if (widget == null) return maxHeight;
 
             // Reconcile the widget into a node tree and measure it
@@ -249,7 +278,7 @@ internal sealed class Hex1bFlowRunner
 
     private async Task RunStepLifecycleAsync(
         FlowStep step,
-        Func<FlowStepContext, Hex1bWidget> builder,
+        Func<FlowStepContext, Task<Hex1bWidget>> builder,
         Hex1bFlowStepOptions? options,
         int desiredHeight)
     {
@@ -309,34 +338,358 @@ internal sealed class Hex1bFlowRunner
                 appOptions.Theme = _options.Theme;
             }
 
-            // Pump output from step adapter to parent adapter
+            // Pump output from step adapter to parent adapter. The pump is
+            // muted for the duration of a resize burst (see resize handler
+            // below) — without it, the inner Hex1bApp's continuous frame
+            // emission (glow animations, focus blink, etc.) lands at the
+            // stale rowOrigin/oldHeight and scrolls the buffer up via the
+            // CR+LF row terminators inside each frame.
             using var outputPumpCts = new CancellationTokenSource();
-            var outputPumpTask = PumpStepOutputAsync(stepAdapter, outputPumpCts.Token);
+            var outputMuteGate = new System.Runtime.CompilerServices.StrongBox<bool>(false);
+            var outputPumpTask = PumpStepOutputAsync(
+                stepAdapter,
+                outputPumpCts.Token,
+                isMuted: () => System.Threading.Volatile.Read(ref outputMuteGate.Value));
 
             // Pump input from parent adapter to step adapter, with resize handling
             using var inputPumpCts = new CancellationTokenSource();
+
+            // Settle state for the new debounced resize path. Captured by
+            // both the per-event handler and the timer callback. The lock
+            // protects every write the resize machinery makes to the parent
+            // adapter so a settle timer firing on the threadpool cannot
+            // interleave with a track-and-clear pass running on the pump
+            // loop.
+            var settleSync = new object();
+            CancellationTokenSource? settleTimerCts = null;
+            (int Width, int Height)? settleOriginalDims = null;
+            // Snapshot of where the active step's render region *was* when
+            // the current burst started. Used at settle time to clear the
+            // pre-burst rectangle in addition to the post-settle one — so
+            // a stale frame the inner Hex1bApp emitted just before the
+            // mute gate closed cannot leave artifacts above or below the
+            // new render.
+            (int RowOrigin, int Height)? settleOriginalRect = null;
+            (int Width, int Height) settleLatestDims = default;
+            var lastKnownWidth = _parentAdapter.Width;
+            var lastKnownHeight = _parentAdapter.Height;
+
             var inputPumpTask = PumpStepInputAsync(stepAdapter, inputPumpCts.Token,
                 onResize: (newWidth, newHeight) =>
                 {
                     var newStepHeight = FlowResizeMath.ComputeStepHeight(options?.MaxHeight, newHeight);
-                    Trace($"onResize: newSize={newWidth}x{newHeight} newStepH={newStepHeight} useSoftWrap={_options.UseSoftWrapTombstones}");
+                    Trace($"onResize: newSize={newWidth}x{newHeight} newStepH={newStepHeight} useSoftWrap={_options.UseSoftWrapTombstones} settleDelay={_options.ResizeSettleDelay}");
+
+                    var useSettle = _options.UseSoftWrapTombstones
+                        && _options.ResizeSettleDelay is { } _;
+
+                    if (useSettle)
+                    {
+                        // "Track cursor on every event, repaint on settle".
+                        //
+                        // Per-event we do NOT touch the screen at all — no
+                        // ESC[J, no placeholder draw, no bottom-overflow
+                        // LFs. The host terminal already owns reflow of
+                        // every byte we've emitted, so its own scrolling
+                        // (if any) keeps the tombstones above naturally
+                        // anchored. We only update internal bookkeeping
+                        // so the settle-time repaint knows where to land.
+                        //
+                        // When events go quiet for ResizeSettleDelay, we
+                        // do any necessary bottom-overflow scroll, clear
+                        // ONLY the active-step rectangle (per-row ESC[2K,
+                        // never ESC[J), optionally drop a resize-marker
+                        // tombstone above it, then ask the inner Hex1bApp
+                        // to repaint into the cleared region.
+                        CancellationToken settleToken;
+                        lock (settleSync)
+                        {
+                            // First event of a burst: snapshot the pre-burst
+                            // rect so we can clear it at settle (the inner
+                            // Hex1bApp may have left a frame painted at the
+                            // old origin/height before the mute gate closed).
+                            if (settleOriginalDims is null)
+                            {
+                                settleOriginalDims = (lastKnownWidth, lastKnownHeight);
+                                settleOriginalRect = (rowOrigin, step.StepHeight);
+                            }
+                            settleLatestDims = (newWidth, newHeight);
+
+                            // Hide the cursor for the duration of the drag
+                            // so it doesn't visibly chase the reflow.
+                            _parentAdapter.Write("\x1b[?25l");
+
+                            // Disable line wrap (DECAWM) for the duration
+                            // of the drag. The inner Hex1bApp keeps
+                            // rendering at the OLD width via the output
+                            // pump (glow animations, focus blink, etc.);
+                            // when the terminal is shrunk, that stale
+                            // wide content would wrap at the new right
+                            // edge and — if any wrap lands on the bottom
+                            // row — scroll the buffer up, pushing the
+                            // tombstones above off-screen. With DECAWM
+                            // off the host terminal truncates instead of
+                            // wrapping, so the stale content lands on
+                            // the active region but never scrolls. The
+                            // settle pass re-enables DECAWM as its last
+                            // act before showing the cursor.
+                            _parentAdapter.Write("\x1b[?7l");
+
+                            // Mute the inner-app output pump for the
+                            // duration of the drag. DECAWM-off protects
+                            // against right-edge wrap, but the inner
+                            // app's frames also contain explicit CR+LF
+                            // row separators (UseSoftWrapEmission =
+                            // true). Those CR+LFs advance the cursor
+                            // unconditionally — if the cursor lands at
+                            // the bottom row of the now-shrunken
+                            // terminal, the buffer scrolls and the
+                            // tombstones above slide off-screen. Muting
+                            // the pump lets the inner app keep rendering
+                            // into the channel without those frames ever
+                            // reaching the parent terminal.
+                            System.Threading.Volatile.Write(ref outputMuteGate.Value, true);
+
+                            // Park the cursor at the home position
+                            // (1,1). The host terminal scrolls the
+                            // primary buffer on shrink to keep the
+                            // cursor visible — and the cursor is
+                            // wherever the inner Hex1bApp last left it
+                            // (typically the textbox row near the
+                            // bottom of the active step). If we don't
+                            // intervene, every subsequent shrink event
+                            // in the burst pushes another row off the
+                            // top. With the cursor parked at the home
+                            // position, the host has no reason to
+                            // scroll on subsequent shrink events. The
+                            // very first event of a burst still loses
+                            // a row or two (the host has already
+                            // scrolled by the time our event handler
+                            // runs), but all later events in the same
+                            // drag are anchored. The settle pass
+                            // restores the cursor to its proper place.
+                            _parentAdapter.Write("\x1b[H");
+
+                            // Render the placeholder (if any) into the
+                            // active rect. With the inner-app output
+                            // pump muted, the prompt would otherwise
+                            // stay frozen showing the pre-resize frame
+                            // (which is laid out for the OLD width and
+                            // would visibly clip/wrap on shrink). The
+                            // placeholder is a deliberately tiny widget
+                            // (typically a single short line) so it
+                            // fits inside even an aggressively shrunken
+                            // viewport.
+                            if (_options.ResizePlaceholder is { } placeholderBuilder)
+                            {
+                                var placeholderRowOrigin = settleOriginalRect?.RowOrigin
+                                    ?? rowOrigin;
+                                var placeholderHeight = settleOriginalRect?.Height
+                                    ?? step.StepHeight;
+
+                                // Use the most up-to-date width we have
+                                // (latest event in the burst). DECAWM
+                                // is off so any over-wide content
+                                // simply truncates at the right edge.
+                                var phSurface = RenderToSurface(
+                                    placeholderBuilder,
+                                    Math.Max(1, newWidth),
+                                    Math.Max(1, placeholderHeight));
+                                if (phSurface is not null)
+                                {
+                                    _parentAdapter.Write(SyncUpdateBegin);
+                                    try
+                                    {
+                                        // Wipe the rect first so we don't
+                                        // composite the placeholder onto
+                                        // the old prompt's leftovers.
+                                        for (var i = 0; i < placeholderHeight; i++)
+                                        {
+                                            var row = placeholderRowOrigin + i;
+                                            if (row < 0 || row >= newHeight) continue;
+                                            _parentAdapter.SetCursorPosition(0, row);
+                                            _parentAdapter.Write("\x1b[2K");
+                                        }
+                                        if (placeholderRowOrigin >= 0
+                                            && placeholderRowOrigin < newHeight)
+                                        {
+                                            _parentAdapter.SetCursorPosition(0, placeholderRowOrigin);
+                                            SoftWrapEmitter.Emit(phSurface, _parentAdapter);
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        _parentAdapter.Write(SyncUpdateEnd);
+                                    }
+                                    // Park the cursor at home again so
+                                    // the placeholder emission (which
+                                    // leaves the cursor at the end of
+                                    // the last paragraph) cannot anchor
+                                    // a subsequent shrink-scroll.
+                                    _parentAdapter.Write("\x1b[H");
+                                }
+                            }
+
+                            // Update internal state for the eventual
+                            // settle. Note: we deliberately don't write
+                            // anything to the parent here — the settle
+                            // pass below recomputes the origin against
+                            // whatever the LATEST dimensions ended up
+                            // being and does the scroll/clear/repaint as
+                            // a single atomic pass.
+                            desiredHeight = newStepHeight;
+                            step.StepHeight = newStepHeight;
+
+                            settleTimerCts?.Cancel();
+                            settleTimerCts = CancellationTokenSource.CreateLinkedTokenSource(inputPumpCts.Token);
+                            settleToken = settleTimerCts.Token;
+                            lastKnownWidth = newWidth;
+                            lastKnownHeight = newHeight;
+                        }
+
+                        var delay = _options.ResizeSettleDelay!.Value;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await Task.Delay(delay, settleToken);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                return;
+                            }
+
+                            lock (settleSync)
+                            {
+                                if (settleToken.IsCancellationRequested) return;
+
+                                var original = settleOriginalDims ?? settleLatestDims;
+                                var dimsChanged = original != settleLatestDims;
+
+                                var settledWidth = settleLatestDims.Width;
+                                var settledHeight = settleLatestDims.Height;
+                                var settledStepHeight = FlowResizeMath.ComputeStepHeight(
+                                    options?.MaxHeight, settledHeight);
+
+                                // Compute where the active step lands at
+                                // the FINAL settled width.
+                                var settledRowOrigin = FlowResizeMath.ComputeRowOriginAtWidth(
+                                    _initialRowOrigin, _emittedTombstones, settledWidth);
+
+                                // Bottom-overflow scroll — applied ONCE,
+                                // at settle time, against the final
+                                // dimensions. Without this the active
+                                // region would render off the bottom of
+                                // a shrunken terminal.
+                                var bottomOverflow = (settledRowOrigin + settledStepHeight) - settledHeight;
+                                if (bottomOverflow > 0)
+                                {
+                                    _parentAdapter.SetCursorPosition(0, settledHeight - 1);
+                                    for (var i = 0; i < bottomOverflow; i++)
+                                    {
+                                        _parentAdapter.Write("\n");
+                                    }
+                                    _initialRowOrigin -= bottomOverflow;
+                                    settledRowOrigin -= bottomOverflow;
+                                }
+
+                                rowOrigin = settledRowOrigin;
+                                stepAdapter.RowOrigin = settledRowOrigin;
+                                _cursorRow = settledRowOrigin;
+                                desiredHeight = settledStepHeight;
+                                step.StepHeight = settledStepHeight;
+
+                                // Optional one-off marker tombstone above
+                                // the active step. EmitSoftWrapTombstone
+                                // advances _cursorRow past the marker so
+                                // the step lands cleanly below it.
+                                if (dimsChanged && _options.ResizeMarker is { } markerBuilder)
+                                {
+                                    var markerSurface = RenderToSurface(
+                                        markerBuilder,
+                                        settledWidth,
+                                        Math.Max(1, settledHeight - settledStepHeight - 1));
+                                    if (markerSurface is not null)
+                                    {
+                                        _parentAdapter.SetCursorPosition(0, rowOrigin);
+                                        EmitSoftWrapTombstone(markerSurface);
+                                        rowOrigin = _cursorRow;
+                                        stepAdapter.RowOrigin = rowOrigin;
+                                    }
+                                }
+
+                                // Clear the union of the pre-burst rect
+                                // and the post-settle rect. Per-event we
+                                // mute the inner Hex1bApp's output pump,
+                                // but the very first frame of a burst may
+                                // already have been written to the parent
+                                // before the mute gate flipped — leaving a
+                                // partial render at the OLD origin/height.
+                                // If settledRowOrigin or settledStepHeight
+                                // moved, that stale fragment can sit above
+                                // or below the new render unless we wipe
+                                // the old rect too. Row-by-row ESC[2K
+                                // (never ESC[J) so a wrong computation
+                                // can't erase tombstones above.
+                                _parentAdapter.Write(SyncUpdateBegin);
+                                try
+                                {
+                                    _parentAdapter.Write("\x1b[?7l");
+
+                                    var clearTop = rowOrigin;
+                                    var clearBottom = rowOrigin + settledStepHeight - 1;
+                                    if (settleOriginalRect is { } origRect)
+                                    {
+                                        clearTop = Math.Min(clearTop, origRect.RowOrigin);
+                                        clearBottom = Math.Max(
+                                            clearBottom, origRect.RowOrigin + origRect.Height - 1);
+                                    }
+                                    for (var row = clearTop; row <= clearBottom; row++)
+                                    {
+                                        if (row < 0 || row >= settledHeight) continue;
+                                        _parentAdapter.SetCursorPosition(0, row);
+                                        _parentAdapter.Write("\x1b[2K");
+                                    }
+                                    _parentAdapter.SetCursorPosition(0, rowOrigin);
+                                    _parentAdapter.Write("\x1b[?7h");
+                                    _parentAdapter.Write("\x1b[?25h"); // show cursor
+                                }
+                                finally
+                                {
+                                    _parentAdapter.Write(SyncUpdateEnd);
+                                }
+
+                                _ = stepAdapter.ResizeAsync(settledWidth, settledStepHeight);
+
+                                // Unmute the output pump. From this point
+                                // the inner Hex1bApp's frames flow back
+                                // through to the parent — its very next
+                                // frame is rendered at the settled
+                                // dimensions so it lands in the cleared
+                                // active rectangle cleanly.
+                                System.Threading.Volatile.Write(ref outputMuteGate.Value, false);
+
+                                settleOriginalDims = null;
+                                settleOriginalRect = null;
+                                settleTimerCts = null;
+                            }
+                        });
+                        return;
+                    }
 
                     if (_options.UseSoftWrapTombstones)
                     {
-                        // Resize strategy: push everything currently visible
-                        // up off the top of the viewport into the host
-                        // terminal's scrollback (where it will appear
-                        // soft-wrapped because tombstones were emitted as
-                        // logical lines), then clear the viewport and
-                        // re-anchor the active step at row 0. This avoids
-                        // any visual mangling from cell-positioned step
-                        // content trying to coexist with reflowed
-                        // tombstones at unpredictable rows.
+                        // Eager soft-wrap path (no settle delay): preserve
+                        // the existing scroll-to-scrollback behaviour so
+                        // callers who haven't opted into settle keep the
+                        // same semantics they've always had.
                         ScrollViewportToScrollback(newHeight);
 
                         stepAdapter.RowOrigin = 0;
                         rowOrigin = 0;
                         _cursorRow = 0;
+                        _initialRowOrigin = 0;
+                        _emittedTombstones.Clear();
                         desiredHeight = newStepHeight;
                         step.StepHeight = newStepHeight;
                     }
@@ -357,6 +710,9 @@ internal sealed class Hex1bFlowRunner
                         desiredHeight = newStepHeight;
                         step.StepHeight = newStepHeight;
                     }
+
+                    lastKnownWidth = newWidth;
+                    lastKnownHeight = newHeight;
 
                     _ = stepAdapter.ResizeAsync(newWidth, newStepHeight);
                 });
@@ -425,7 +781,7 @@ internal sealed class Hex1bFlowRunner
     /// Runs a full-screen TUI application in the alternate screen buffer.
     /// </summary>
     internal async Task RunFullScreenStepAsync(
-        Func<Hex1bApp, Hex1bAppOptions, Func<RootContext, Hex1bWidget>> configure)
+        Func<Hex1bApp, Hex1bAppOptions, Func<RootContext, Task<Hex1bWidget>>> configure)
     {
         // The parent adapter handles alt-buffer transitions naturally
         // We create a standard Hex1bApp with the parent adapter
@@ -441,10 +797,10 @@ internal sealed class Hex1bFlowRunner
         }
 
         Hex1bApp? app = null;
-        Func<RootContext, Hex1bWidget>? widgetBuilder = null;
+        Func<RootContext, Task<Hex1bWidget>>? widgetBuilder = null;
         bool configureInvoked = false;
 
-        Func<RootContext, Hex1bWidget> wrappedBuilder = ctx =>
+        Func<RootContext, Task<Hex1bWidget>> wrappedBuilder = ctx =>
         {
             if (!configureInvoked)
             {
@@ -470,12 +826,12 @@ internal sealed class Hex1bFlowRunner
     /// pages with the terminal scrolling between each page so no content is lost.
     /// </summary>
     private async Task<int> RenderYieldWidgetAsync(
-        Func<RootContext, Hex1bWidget> yieldBuilder,
+        Func<RootContext, Task<Hex1bWidget>> yieldBuilder,
         int width,
         int maxHeight)
     {
         // First, measure the yield widget to determine its natural height.
-        var measuredHeight = MeasureYieldHeight(yieldBuilder, width, maxHeight * 10);
+        var measuredHeight = await MeasureYieldHeightAsync(yieldBuilder, width, maxHeight * 10);
         if (measuredHeight < 1) measuredHeight = 1;
 
         // If it fits in one screen, render in place
@@ -511,10 +867,10 @@ internal sealed class Hex1bFlowRunner
 
             // Render a step of the yield content at the current offset
             int offset = totalRendered;
-            await RenderYieldPageAsync(ctx =>
+            await RenderYieldPageAsync(async ctx =>
             {
                 // Build a wrapper that skips the first 'offset' rows and takes 'pageHeight'
-                var fullWidget = yieldBuilder(ctx);
+                var fullWidget = await yieldBuilder(ctx);
                 return fullWidget;
             }, width, pageHeight, offset);
 
@@ -527,21 +883,19 @@ internal sealed class Hex1bFlowRunner
     }
 
     /// <summary>
-    /// Measures the natural height of a yield widget tree.
+    /// Measures the natural height of a yield widget tree. Async sibling that awaits the builder
+    /// properly; falls back to height 1 if the builder or reconciliation isn't synchronous.
     /// </summary>
-    private int MeasureYieldHeight(Func<RootContext, Hex1bWidget> yieldBuilder, int width, int maxHeight)
+    private async Task<int> MeasureYieldHeightAsync(Func<RootContext, Task<Hex1bWidget>> yieldBuilder, int width, int maxHeight)
     {
         try
         {
             var rootCtx = new RootContext();
-            var widget = yieldBuilder(rootCtx);
+            var widget = await yieldBuilder(rootCtx);
             if (widget == null) return 1;
 
             var reconcileCtx = ReconcileContext.CreateRoot();
-            var nodeTask = widget.ReconcileAsync(null, reconcileCtx);
-            if (!nodeTask.IsCompleted) return 1;
-
-            var node = nodeTask.Result;
+            var node = await widget.ReconcileAsync(null, reconcileCtx);
             if (node == null) return 1;
 
             var constraints = new Constraints(0, width, 0, maxHeight);
@@ -558,17 +912,17 @@ internal sealed class Hex1bFlowRunner
     /// Renders a yield widget page at the current cursor position.
     /// </summary>
     private async Task RenderYieldPageAsync(
-        Func<RootContext, Hex1bWidget> yieldBuilder,
+        Func<RootContext, Task<Hex1bWidget>> yieldBuilder,
         int width,
         int height,
         int skipRows = 0)
     {
-        Func<RootContext, Hex1bWidget> actualBuilder;
+        Func<RootContext, Task<Hex1bWidget>> actualBuilder;
         if (skipRows > 0)
         {
-            actualBuilder = ctx =>
+            actualBuilder = async ctx =>
             {
-                var widget = yieldBuilder(ctx);
+                var widget = await yieldBuilder(ctx);
                 if (widget is VStackWidget vstack && skipRows < vstack.Children.Count)
                 {
                     var remaining = vstack.Children.Skip(skipRows).Take(height).ToArray();
@@ -606,7 +960,7 @@ internal sealed class Hex1bFlowRunner
 
             yieldApp = new Hex1bApp(ctx =>
             {
-                var widget = actualBuilder(ctx);
+                var widgetTask = actualBuilder(ctx);
                 if (!rendered)
                 {
                     rendered = true;
@@ -616,7 +970,7 @@ internal sealed class Hex1bFlowRunner
                         yieldApp?.RequestStop();
                     });
                 }
-                return widget;
+                return widgetTask;
             }, yieldOptions);
 
             await using (yieldApp)
@@ -645,28 +999,48 @@ internal sealed class Hex1bFlowRunner
         _parentAdapter.Write(sb.ToString());
     }
 
-    /// <summary>
-    /// Renders a yield builder into a freshly-allocated <see cref="Surface"/>.
-    /// Returns <c>null</c> if reconciliation, measurement, or rendering fails
-    /// — callers should fall back to the legacy emission path in that case.
-    /// </summary>
-    /// <remarks>
-    /// Used only on the soft-wrap tombstone path
-    /// (<see cref="Hex1bFlowOptions.UseSoftWrapTombstones"/>). The surface is
-    /// sized to <paramref name="width"/> by the widget's measured height
-    /// (clamped to <paramref name="maxHeight"/> × 10 to bound page-by-page
-    /// content). The surface is then arranged and rendered using the standard
-    /// rendering pipeline so any widget that works on screen will work here.
-    /// </remarks>
     private Surface? RenderToSurface(
         Func<RootContext, Hex1bWidget> builder,
+        int width,
+        int maxHeight)
+        => RenderToSurface(ctx => Task.FromResult(builder(ctx)), width, maxHeight);
+
+    /// <summary>
+    /// Renders an async widget builder into a freshly-allocated <see cref="Surface"/>
+    /// synchronously. Returns <c>null</c> if the builder Task hasn't already completed,
+    /// if reconciliation needs to go async, or if anything throws — callers should
+    /// fall back to the legacy emission path in that case.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Used by call sites that can't await (the per-event resize-burst handler and
+    /// the settle-task body, both of which run inside <c>lock(settleSync)</c>).
+    /// The "must already be completed" invariant mirrors the existing constraint
+    /// on <see cref="Hex1bWidget.ReconcileAsync"/>: flow tombstones build widgets
+    /// from pre-resolved state and wrap them with <see cref="Task.FromResult{TResult}(TResult)"/>,
+    /// so the Task is completed inline on the caller's thread. Truly-async builders
+    /// (network IO etc.) simply skip a resize frame and the next event re-triggers.
+    /// </para>
+    /// <para>
+    /// Used only on the soft-wrap tombstone path
+    /// (<see cref="Hex1bFlowOptions.UseSoftWrapTombstones"/>). The surface is sized
+    /// to <paramref name="width"/> by the widget's measured height (clamped to
+    /// <paramref name="maxHeight"/> × 10 to bound page-by-page content). The surface
+    /// is then arranged and rendered using the standard rendering pipeline so any
+    /// widget that works on screen will work here.
+    /// </para>
+    /// </remarks>
+    private Surface? RenderToSurface(
+        Func<RootContext, Task<Hex1bWidget>> builder,
         int width,
         int maxHeight)
     {
         try
         {
             var rootCtx = new RootContext();
-            var widget = builder(rootCtx);
+            var widgetTask = builder(rootCtx);
+            if (!widgetTask.IsCompletedSuccessfully) return null;
+            var widget = widgetTask.Result;
             if (widget == null) return null;
 
             var reconcileCtx = ReconcileContext.CreateRoot();
@@ -679,27 +1053,61 @@ internal sealed class Hex1bFlowRunner
             var node = nodeTask.Result;
             if (node == null) return null;
 
-            // Measure with a generous height bound so multi-line tombstones
-            // get their full height, then clamp to a safety ceiling so a
-            // misbehaving widget can't allocate an unbounded surface.
-            var measureMax = Math.Max(maxHeight * 10, maxHeight);
-            var constraints = new Constraints(0, width, 0, measureMax);
-            var measured = node.Measure(constraints);
-            var height = Math.Max(1, Math.Min(measured.Height, measureMax));
-
-            var surface = new Surface(width, height);
-            node.Arrange(new Rect(0, 0, width, height));
-
-            var renderCtx = new SurfaceRenderContext(surface, _options.Theme);
-            renderCtx.SetCapabilities(_parentAdapter.Capabilities);
-            node.Render(renderCtx);
-
-            return surface;
+            return MaterializeSurface(node, width, maxHeight);
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Async sibling of <see cref="RenderToSurface(Func{RootContext, Task{Hex1bWidget}}, int, int)"/>
+    /// for callers that can <c>await</c> the builder (and reconciliation) properly.
+    /// Used by the static/yield/completed-tombstone paths that already run in
+    /// <c>async Task</c> methods.
+    /// </summary>
+    private async Task<Surface?> RenderToSurfaceAsync(
+        Func<RootContext, Task<Hex1bWidget>> builder,
+        int width,
+        int maxHeight)
+    {
+        try
+        {
+            var rootCtx = new RootContext();
+            var widget = await builder(rootCtx);
+            if (widget == null) return null;
+
+            var reconcileCtx = ReconcileContext.CreateRoot();
+            var node = await widget.ReconcileAsync(null, reconcileCtx);
+            if (node == null) return null;
+
+            return MaterializeSurface(node, width, maxHeight);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private Surface? MaterializeSurface(Hex1bNode node, int width, int maxHeight)
+    {
+        // Measure with a generous height bound so multi-line tombstones
+        // get their full height, then clamp to a safety ceiling so a
+        // misbehaving widget can't allocate an unbounded surface.
+        var measureMax = Math.Max(maxHeight * 10, maxHeight);
+        var constraints = new Constraints(0, width, 0, measureMax);
+        var measured = node.Measure(constraints);
+        var height = Math.Max(1, Math.Min(measured.Height, measureMax));
+
+        var surface = new Surface(width, height);
+        node.Arrange(new Rect(0, 0, width, height));
+
+        var renderCtx = new SurfaceRenderContext(surface, _options.Theme);
+        renderCtx.SetCapabilities(_parentAdapter.Capabilities);
+        node.Render(renderCtx);
+
+        return surface;
     }
 
     /// <summary>
@@ -730,13 +1138,34 @@ internal sealed class Hex1bFlowRunner
                 _parentAdapter.Write("\n");
             }
             _cursorRow -= overflow;
-            Trace($"EmitSoftWrapTombstone[#{emitId}] pre-scroll: overflow={overflow} -> cursorRow={_cursorRow}");
+            // The viewport scrolled up by `overflow` rows, so every
+            // previously-emitted tombstone (and the initial anchor) moved up
+            // by the same amount on screen. Track that shift so
+            // ComputeRowOriginAtWidth keeps returning the correct on-screen
+            // row for the active step after a future resize.
+            _initialRowOrigin -= overflow;
+            Trace($"EmitSoftWrapTombstone[#{emitId}] pre-scroll: overflow={overflow} -> cursorRow={_cursorRow} initialRowOrigin={_initialRowOrigin}");
         }
 
         // Position the cursor at the row where the tombstone should land.
         _parentAdapter.SetCursorPosition(0, _cursorRow);
 
         SoftWrapEmitter.Emit(surface, _parentAdapter);
+
+        // Capture this tombstone's per-paragraph widths so the soft-wrap
+        // settle-mode resize handler can recompute the active step's
+        // row origin at any width. Each surface row corresponds to one
+        // CR+LF-terminated paragraph (the SoftWrapEmitter contract); the
+        // logical width is the column index of the last non-blank cell
+        // plus one. Empty rows count as zero-width paragraphs and still
+        // occupy one display row on reflow (the Math.Max(1, ...) in
+        // ComputeRowOriginAtWidth handles that).
+        var paragraphWidths = new int[height];
+        for (var row = 0; row < height; row++)
+        {
+            paragraphWidths[row] = MeasureSurfaceRowWidth(surface, row);
+        }
+        _emittedTombstones.Add(paragraphWidths);
 
         // The emitter terminates rows 0 .. height-2 with CR + LF (each
         // advances the cursor down one row, with no scrolling because we
@@ -752,6 +1181,36 @@ internal sealed class Hex1bFlowRunner
         _cursorRow += height;
 
         Trace($"EmitSoftWrapTombstone[#{emitId}] exit: cursorRow={_cursorRow}");
+    }
+
+    /// <summary>
+    /// Returns the logical paragraph width of the given surface row — the
+    /// column index of the last non-blank cell plus one. Mirrors the
+    /// trailing-blank trimming that <see cref="SoftWrapEmitter"/> performs
+    /// when it emits the row, so the recorded paragraph width matches the
+    /// number of cells the host terminal will actually have to reflow.
+    /// </summary>
+    private static int MeasureSurfaceRowWidth(Surface surface, int row)
+    {
+        var width = surface.Width;
+        for (var x = width - 1; x >= 0; x--)
+        {
+            var cell = surface.GetCell(x, row);
+            if (cell.IsContinuation)
+            {
+                // A continuation cell means the wide glyph occupies (x-1, x);
+                // treat (x) as content because removing only the continuation
+                // would mis-report the wide character's footprint.
+                return x + 1;
+            }
+            if (cell.Character != " "
+                && cell.Character != string.Empty
+                && cell.Character != SurfaceCells.UnwrittenMarker)
+            {
+                return x + 1;
+            }
+        }
+        return 0;
     }
 
     /// <summary>
@@ -822,7 +1281,10 @@ internal sealed class Hex1bFlowRunner
     /// <summary>
     /// Pumps output from a step adapter to the parent adapter.
     /// </summary>
-    private async Task PumpStepOutputAsync(InlineStepAdapter stepAdapter, CancellationToken ct)
+    private async Task PumpStepOutputAsync(
+        InlineStepAdapter stepAdapter,
+        CancellationToken ct,
+        Func<bool>? isMuted = null)
     {
         try
         {
@@ -830,6 +1292,11 @@ internal sealed class Hex1bFlowRunner
             {
                 var data = await stepAdapter.ReadOutputAsync(ct);
                 if (data.IsEmpty) continue;
+                // Drop frames while the runner has the pump muted (e.g.
+                // during a resize burst). Forwarding them would replay
+                // stale-sized content at the stale rowOrigin, which is
+                // the dominant cause of buffer-scroll during a drag.
+                if (isMuted?.Invoke() == true) continue;
                 _parentAdapter.Write(Encoding.UTF8.GetString(data.Span));
             }
         }
@@ -968,4 +1435,63 @@ public sealed class Hex1bFlowOptions
     /// </para>
     /// </remarks>
     public bool UseSoftWrapTombstones { get; set; }
+
+    /// <summary>
+    /// Quiet window required after the last <c>Hex1bResizeEvent</c> before
+    /// the runner re-renders the active step at the new size. When
+    /// <c>null</c> (the default), the runner repaints eagerly on every
+    /// resize event — today's behaviour. When set, the runner enters a
+    /// two-phase resize mode: every resize event performs a cheap
+    /// "track-and-clear" pass (recompute where the active step should
+    /// land at the new width, move the cursor there, and erase the region
+    /// below), and only after the terminal has been idle for the settle
+    /// delay does the inner step app re-render.
+    /// </summary>
+    /// <remarks>
+    /// Only takes effect when <see cref="UseSoftWrapTombstones"/> is also
+    /// <c>true</c>: the track-and-clear pass relies on tombstones above
+    /// the active step being hard-newline-terminated paragraphs that the
+    /// host terminal will not reflow across paragraph boundaries.
+    /// Recommended value: 50–100 ms.
+    /// </remarks>
+    public TimeSpan? ResizeSettleDelay { get; set; }
+
+    /// <summary>
+    /// Optional widget builder emitted as a one-off hard-newline tombstone
+    /// <em>above</em> the repainted step after the resize has settled, but
+    /// only when the final dimensions differ from the dimensions at the
+    /// start of the settle window. Intended for a faint
+    /// "─── terminal resized ───" breadcrumb. When <c>null</c> (the
+    /// default), no marker is emitted.
+    /// </summary>
+    /// <remarks>
+    /// <para>Has no effect when <see cref="ResizeSettleDelay"/> is <c>null</c>.</para>
+    /// <para>
+    /// Sync-only by design: the runner invokes this builder from a render-time
+    /// critical section that cannot <c>await</c>. Build the widget from
+    /// already-resolved state and rely on the rest of the flow API's async
+    /// surface for IO-bearing work.
+    /// </para>
+    /// </remarks>
+    public Func<RootContext, Hex1bWidget>? ResizeMarker { get; set; }
+
+    /// <summary>
+    /// Optional widget builder rendered in place of the active step's
+    /// content during a drag-resize burst. The placeholder is drawn at
+    /// each per-event tick into the active rectangle and is then replaced
+    /// by the actual repainted step at settle. Use a deliberately tiny
+    /// widget (a single short line is ideal) so it fits inside even an
+    /// aggressively shrunken viewport. When <c>null</c> (the default),
+    /// the active rectangle simply stays cleared during the drag.
+    /// </summary>
+    /// <remarks>
+    /// <para>Has no effect when <see cref="ResizeSettleDelay"/> is <c>null</c>.</para>
+    /// <para>
+    /// Sync-only by design: the runner invokes this builder per resize event
+    /// from a critical section that cannot <c>await</c>. Build the widget
+    /// from already-resolved state and rely on the rest of the flow API's
+    /// async surface for IO-bearing work.
+    /// </para>
+    /// </remarks>
+    public Func<RootContext, Hex1bWidget>? ResizePlaceholder { get; set; }
 }
