@@ -1312,12 +1312,18 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             {
                 ReadOnlyMemory<byte> data;
                 IReadOnlyList<AnsiToken>? preTokenizedTokens = null;
+                byte[]? pooledItemBuffer = null;
+                List<AnsiToken>? pooledItemTokens = null;
+                Action<List<AnsiToken>>? pooledItemTokensReturn = null;
 
                 if (_workload is IHex1bTerminalTokenWorkloadAdapter tokenWorkload)
                 {
                     var item = await tokenWorkload.ReadOutputItemAsync(ct);
                     data = item.Bytes;
                     preTokenizedTokens = item.Tokens;
+                    pooledItemBuffer = item.PooledBuffer;
+                    pooledItemTokens = item.PooledTokens;
+                    pooledItemTokensReturn = item.PooledTokensReturn;
                 }
                 else
                 {
@@ -1326,6 +1332,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 
                 if (data.IsEmpty)
                 {
+                    if (pooledItemBuffer is not null)
+                        System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
+                    if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
+                        pooledItemTokensReturn(pooledItemTokens);
+
                     // Channel empty - this is a frame boundary
                     await NotifyWorkloadFiltersFrameCompleteAsync();
                     
@@ -1334,6 +1345,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     continue;
                 }
                 
+                try
+                {
                 string? completeText = null;
                 IReadOnlyList<AnsiToken> tokens;
 
@@ -1430,6 +1443,14 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         await _presentation.WriteOutputAsync(filteredBytes, ct);
                         _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
                     }
+                }
+                }
+                finally
+                {
+                    if (pooledItemBuffer is not null)
+                        System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
+                    if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
+                        pooledItemTokensReturn(pooledItemTokens);
                 }
             }
         }

@@ -1,5 +1,6 @@
 using Hex1b.Theming;
 using Hex1b.Tokens;
+using System.Text;
 
 namespace Hex1b.Surfaces;
 
@@ -30,9 +31,34 @@ public static class SurfaceComparer
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(current);
 
+        var diff = new SurfaceDiff();
+        CompareInto(previous, current, diff);
+        return diff;
+    }
+
+    /// <summary>
+    /// Reusable variant of <see cref="Compare(Surface, Surface)"/> that populates the
+    /// supplied <see cref="SurfaceDiff"/> in place. The renderer hot path uses this to
+    /// avoid allocating a fresh diff and backing list every frame.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if the simple 4-field fast path was used (both surfaces report
+    /// <see cref="Surface.IsFastPathEligible"/>), otherwise <see langword="false"/> for the
+    /// full per-cell slow path. Used by the renderer to record fast/slow-path engagement
+    /// metrics.
+    /// </returns>
+    internal static bool CompareInto(Surface previous, Surface current, SurfaceDiff dest)
+    {
+        ArgumentNullException.ThrowIfNull(previous);
+        ArgumentNullException.ThrowIfNull(current);
+        ArgumentNullException.ThrowIfNull(dest);
+
+        var changed = dest.MutableCells;
+        changed.Clear();
+
         // Fast path: same instance means no changes
         if (ReferenceEquals(previous, current))
-            return SurfaceDiff.Empty;
+            return true;
 
         if (previous.Width != current.Width || previous.Height != current.Height)
         {
@@ -44,8 +70,31 @@ public static class SurfaceComparer
         var height = current.Height;
         var prevCells = previous.CellsUnsafe;
         var currCells = current.CellsUnsafe;
-        
-        var changedCells = new List<ChangedCell>();
+
+        // Fast path: when neither surface contains wide cells, underline state,
+        // multi-codepoint graphemes, or tracked refs (sixel/kgp/hyperlink), we can
+        // skip the per-cell branches for those fields entirely. This is a 4-field
+        // compare instead of ~10, and the helper is small enough to inline.
+        if (previous.IsFastPathEligible && current.IsFastPathEligible)
+        {
+            for (var y = 0; y < height; y++)
+            {
+                var rowOffset = y * width;
+                for (var x = 0; x < width; x++)
+                {
+                    var index = rowOffset + x;
+                    ref readonly var prevCell = ref prevCells[index];
+                    ref readonly var currCell = ref currCells[index];
+
+                    if (!CellsEqualFast(in prevCell, in currCell))
+                    {
+                        changed.Add(new ChangedCell(x, y, currCell));
+                    }
+                }
+            }
+
+            return true;
+        }
 
         for (var y = 0; y < height; y++)
         {
@@ -58,12 +107,15 @@ public static class SurfaceComparer
 
                 if (!CellsEqual(prevCell, currCell))
                 {
-                    changedCells.Add(new ChangedCell(x, y, currCell));
+                    changed.Add(new ChangedCell(x, y, currCell));
                 }
             }
         }
 
-        return new SurfaceDiff(changedCells);
+        // No SortChanges call: we add in row-major order (Y outer, X inner),
+        // which is exactly the order SortChanges produces. Skipping the sort
+        // saves an O(N log N) pass on every frame.
+        return false;
     }
 
     /// <summary>
@@ -79,12 +131,52 @@ public static class SurfaceComparer
     {
         ArgumentNullException.ThrowIfNull(surface);
 
+        var diff = new SurfaceDiff();
+        CompareToEmptyInto(surface, diff);
+        return diff;
+    }
+
+    /// <summary>
+    /// Reusable variant of <see cref="CompareToEmpty(Surface)"/> that populates the
+    /// supplied <see cref="SurfaceDiff"/> in place.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> when the simple 4-field fast path was used (the surface
+    /// is <see cref="Surface.IsFastPathEligible"/>); otherwise <see langword="false"/>.
+    /// </returns>
+    internal static bool CompareToEmptyInto(Surface surface, SurfaceDiff dest)
+    {
+        ArgumentNullException.ThrowIfNull(surface);
+        ArgumentNullException.ThrowIfNull(dest);
+
+        var changed = dest.MutableCells;
+        changed.Clear();
+
         var width = surface.Width;
         var height = surface.Height;
         var cells = surface.CellsUnsafe;
         var empty = SurfaceCells.Empty;
-        
-        var changedCells = new List<ChangedCell>();
+
+        // Fast path: see CompareInto. Empty is itself a "simple" cell, so when the
+        // surface is fast-eligible we can compare against it with the 4-field equal.
+        if (surface.IsFastPathEligible)
+        {
+            for (var y = 0; y < height; y++)
+            {
+                var rowOffset = y * width;
+                for (var x = 0; x < width; x++)
+                {
+                    ref readonly var cell = ref cells[rowOffset + x];
+
+                    if (!CellsEqualFast(in cell, in empty))
+                    {
+                        changed.Add(new ChangedCell(x, y, cell));
+                    }
+                }
+            }
+
+            return true;
+        }
 
         for (var y = 0; y < height; y++)
         {
@@ -95,12 +187,13 @@ public static class SurfaceComparer
 
                 if (!CellsEqual(cell, empty))
                 {
-                    changedCells.Add(new ChangedCell(x, y, cell));
+                    changed.Add(new ChangedCell(x, y, cell));
                 }
             }
         }
 
-        return new SurfaceDiff(changedCells);
+        // No SortChanges call: see CompareInto - same row-major add order.
+        return false;
     }
 
     /// <summary>
@@ -145,11 +238,29 @@ public static class SurfaceComparer
     public static IReadOnlyList<AnsiToken> ToTokens(SurfaceDiff diff, Surface? currentSurface, Surface? previousSurface, bool skipKgpEmission = false)
     {
         ArgumentNullException.ThrowIfNull(diff);
+        if (diff.IsEmpty) return Array.Empty<AnsiToken>();
 
-        if (diff.IsEmpty)
-            return Array.Empty<AnsiToken>();
+        var output = new List<AnsiToken>();
+        ToTokensInto(diff, currentSurface, previousSurface, skipKgpEmission, output);
+        return output.Count == 0 ? Array.Empty<AnsiToken>() : output;
+    }
 
-        var tokens = new List<AnsiToken>();
+    /// <summary>
+    /// Reusable variant of <see cref="ToTokens(SurfaceDiff, Surface?, Surface?, bool)"/> that
+    /// appends to the supplied <paramref name="output"/> list. The renderer hot path uses
+    /// this with a list it owns across frames to avoid per-frame token-list allocations.
+    /// The list is cleared before population.
+    /// </summary>
+    internal static void ToTokensInto(SurfaceDiff diff, Surface? currentSurface, Surface? previousSurface, bool skipKgpEmission, List<AnsiToken> output)
+    {
+        ArgumentNullException.ThrowIfNull(diff);
+        ArgumentNullException.ThrowIfNull(output);
+
+        output.Clear();
+
+        if (diff.IsEmpty) return;
+
+        var tokens = output;
         
         // Emit KGP delete commands for images that were in the previous surface but have
         // moved or been removed. KGP placements persist in the terminal until explicitly
@@ -404,6 +515,11 @@ public static class SurfaceComparer
         bool stateUnknown = true;
         TrackedObject<HyperlinkData>? currentHyperlink = null;
 
+        // Reused across all changed cells; passed by ref to BuildSgrParametersBytes.
+        // SGR parameter strings cap out well below 96 bytes even with reset+attrs+RGB
+        // foreground+RGB background+RGB underline colour, e.g. "0;1;3;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255" is 56 bytes.
+        Span<byte> sgrBuf = stackalloc byte[96];
+
         foreach (var change in diff.ChangedCells)
         {
             // Skip continuation cells - they're handled by the wide character before them
@@ -459,7 +575,8 @@ public static class SurfaceComparer
 
             if (needsSgr)
             {
-                var sgrParams = BuildSgrParameters(
+                var written = BuildSgrParametersBytes(
+                    sgrBuf,
                     change.Cell,
                     stateUnknown,
                     ref currentFg,
@@ -467,10 +584,10 @@ public static class SurfaceComparer
                     ref currentAttrs,
                     ref currentUnderlineStyle,
                     ref currentUnderlineColor);
-                
-                if (!string.IsNullOrEmpty(sgrParams))
+
+                if (written > 0)
                 {
-                    tokens.Add(new SgrToken(sgrParams));
+                    tokens.Add(AnsiTokenCache.GetSgrTokenFromBytes(sgrBuf.Slice(0, written)));
                 }
                 stateUnknown = false;
             }
@@ -545,7 +662,7 @@ public static class SurfaceComparer
                 ? " " 
                 : change.Cell.Character;
             
-            tokens.Add(new TextToken(charToOutput));
+            tokens.Add(AnsiTokenCache.GetTextToken(charToOutput));
             
             // Cursor advances by display width
             cursorX += Math.Max(1, change.Cell.DisplayWidth);
@@ -567,8 +684,6 @@ public static class SurfaceComparer
                 EmitKgpTokens(tokens, data);
             }
         }
-
-        return tokens;
     }
     
     /// <summary>
@@ -692,6 +807,20 @@ public static class SurfaceComparer
 
     #region Private Helpers
 
+    /// <summary>
+    /// Slim 4-field equality used by the fast diff path. Only safe to call when
+    /// both cells are known not to carry tracked refs, underline state, multi-
+    /// codepoint graphemes, or a non-default display width — i.e. when both
+    /// owning surfaces report <see cref="Surface.IsFastPathEligible"/>.
+    /// </summary>
+    private static bool CellsEqualFast(in SurfaceCell a, in SurfaceCell b)
+    {
+        return a.Character == b.Character
+            && a.Attributes == b.Attributes
+            && ColorsEqual(a.Foreground, b.Foreground)
+            && ColorsEqual(a.Background, b.Background);
+    }
+
     private static bool CellsEqual(SurfaceCell a, SurfaceCell b)
     {
         // Compare visual properties and hyperlink
@@ -699,7 +828,9 @@ public static class SurfaceComparer
             !ColorsEqual(a.Foreground, b.Foreground) ||
             !ColorsEqual(a.Background, b.Background) ||
             a.Attributes != b.Attributes ||
-            a.DisplayWidth != b.DisplayWidth)
+            a.DisplayWidth != b.DisplayWidth ||
+            a.UnderlineStyle != b.UnderlineStyle ||
+            !ColorsEqual(a.UnderlineColor, b.UnderlineColor))
         {
             return false;
         }
@@ -754,7 +885,7 @@ public static class SurfaceComparer
                a.Value.AnsiIndex == b.Value.AnsiIndex;
     }
 
-    private static string BuildSgrParameters(
+    private static StringBuilder BuildSgrParameters(
         SurfaceCell targetCell,
         bool stateUnknown,
         ref Hex1bColor? currentFg,
@@ -763,7 +894,7 @@ public static class SurfaceComparer
         ref UnderlineStyle currentUnderlineStyle,
         ref Hex1bColor? currentUnderlineColor)
     {
-        var parts = new List<string>();
+        var sb = AnsiTokenCache.GetSgrBuilder();
 
         // Check if we need a reset first
         // Reset if: state is unknown, OR turning OFF any attributes, OR clearing colors
@@ -775,7 +906,7 @@ public static class SurfaceComparer
 
         if (needsReset)
         {
-            parts.Add("0"); // Reset to defaults
+            sb.Append('0'); // Reset to defaults
             currentAttrs = CellAttributes.None;
             currentFg = null;
             currentBg = null;
@@ -787,60 +918,45 @@ public static class SurfaceComparer
         var toTurnOn = targetCell.Attributes & ~currentAttrs;
 
         if ((toTurnOn & CellAttributes.Bold) != 0)
-            parts.Add("1");
+            AppendPart(sb, "1");
         if ((toTurnOn & CellAttributes.Dim) != 0)
-            parts.Add("2");
+            AppendPart(sb, "2");
         if ((toTurnOn & CellAttributes.Italic) != 0)
-            parts.Add("3");
+            AppendPart(sb, "3");
         if ((toTurnOn & CellAttributes.Underline) != 0)
         {
-            // Emit styled underline using colon sub-parameter syntax
-            var style = targetCell.UnderlineStyle;
-            parts.Add(style switch
-            {
-                UnderlineStyle.Double => "21",
-                UnderlineStyle.Curly => "4:3",
-                UnderlineStyle.Dotted => "4:4",
-                UnderlineStyle.Dashed => "4:5",
-                _ => "4", // Single or default
-            });
+            AppendPart(sb, UnderlineSgrCode(targetCell.UnderlineStyle));
         }
         else if ((currentAttrs & CellAttributes.Underline) != 0 &&
                  (targetCell.Attributes & CellAttributes.Underline) != 0 &&
                  targetCell.UnderlineStyle != currentUnderlineStyle)
         {
             // Underline is already on but style changed — re-emit with new style
-            var style = targetCell.UnderlineStyle;
-            parts.Add(style switch
-            {
-                UnderlineStyle.Double => "21",
-                UnderlineStyle.Curly => "4:3",
-                UnderlineStyle.Dotted => "4:4",
-                UnderlineStyle.Dashed => "4:5",
-                _ => "4",
-            });
+            AppendPart(sb, UnderlineSgrCode(targetCell.UnderlineStyle));
         }
         if ((toTurnOn & CellAttributes.Blink) != 0)
-            parts.Add("5");
+            AppendPart(sb, "5");
         if ((toTurnOn & CellAttributes.Reverse) != 0)
-            parts.Add("7");
+            AppendPart(sb, "7");
         if ((toTurnOn & CellAttributes.Hidden) != 0)
-            parts.Add("8");
+            AppendPart(sb, "8");
         if ((toTurnOn & CellAttributes.Strikethrough) != 0)
-            parts.Add("9");
+            AppendPart(sb, "9");
         if ((toTurnOn & CellAttributes.Overline) != 0)
-            parts.Add("53");
+            AppendPart(sb, "53");
 
         // Add foreground color if different
         if (!ColorsEqual(targetCell.Foreground, currentFg) && targetCell.Foreground is not null)
         {
-            parts.Add(BuildColorSgr(targetCell.Foreground.Value, isForeground: true));
+            AppendSeparator(sb);
+            AppendColorSgr(sb, targetCell.Foreground.Value, isForeground: true);
         }
 
         // Add background color if different
         if (!ColorsEqual(targetCell.Background, currentBg) && targetCell.Background is not null)
         {
-            parts.Add(BuildColorSgr(targetCell.Background.Value, isForeground: false));
+            AppendSeparator(sb);
+            AppendColorSgr(sb, targetCell.Background.Value, isForeground: false);
         }
 
         // Underline color (SGR 58;2;R;G;B)
@@ -849,11 +965,12 @@ public static class SurfaceComparer
             if (targetCell.UnderlineColor is not null)
             {
                 var ulc = targetCell.UnderlineColor.Value;
-                parts.Add($"58;2;{ulc.R};{ulc.G};{ulc.B}");
+                AppendSeparator(sb);
+                sb.Append("58;2;").Append(ulc.R).Append(';').Append(ulc.G).Append(';').Append(ulc.B);
             }
             else if (currentUnderlineColor is not null)
             {
-                parts.Add("59"); // Default underline color
+                AppendPart(sb, "59"); // Default underline color
             }
         }
 
@@ -864,18 +981,220 @@ public static class SurfaceComparer
         currentUnderlineStyle = targetCell.UnderlineStyle;
         currentUnderlineColor = targetCell.UnderlineColor;
 
-        return string.Join(";", parts);
+        return sb;
+    }
+
+    private static void AppendPart(StringBuilder sb, string part)
+    {
+        AppendSeparator(sb);
+        sb.Append(part);
+    }
+
+    private static void AppendSeparator(StringBuilder sb)
+    {
+        if (sb.Length > 0) sb.Append(';');
+    }
+
+    // -----------------------------------------------------------------------
+    // Fast byte-formatting SGR builder. Writes directly into a stackalloc'd
+    // Span<byte> via Utf8Formatter.TryFormat — bypasses StringBuilder rent +
+    // char Append + ToString + GetHashCode-over-chars + string-keyed dict
+    // lookup that the legacy BuildSgrParameters path goes through. The output
+    // span is fed to AnsiTokenCache.GetSgrTokenFromBytes which uses a
+    // byte-keyed cache and stores the wire-ready bytes on SgrToken for the
+    // serializer to memcpy.
+    //
+    // Mirror of BuildSgrParameters; keep the two in lockstep. Any new SGR
+    // emit case must be ported to both until BuildSgrParameters is retired.
+    // -----------------------------------------------------------------------
+    private static int BuildSgrParametersBytes(
+        Span<byte> dest,
+        SurfaceCell targetCell,
+        bool stateUnknown,
+        ref Hex1bColor? currentFg,
+        ref Hex1bColor? currentBg,
+        ref CellAttributes currentAttrs,
+        ref UnderlineStyle currentUnderlineStyle,
+        ref Hex1bColor? currentUnderlineColor)
+    {
+        int pos = 0;
+
+        var turnedOff = currentAttrs & ~targetCell.Attributes;
+        bool needsReset = stateUnknown ||
+                         turnedOff != CellAttributes.None ||
+                         (currentFg is not null && targetCell.Foreground is null) ||
+                         (currentBg is not null && targetCell.Background is null);
+
+        if (needsReset)
+        {
+            dest[pos++] = (byte)'0';
+            currentAttrs = CellAttributes.None;
+            currentFg = null;
+            currentBg = null;
+            currentUnderlineStyle = UnderlineStyle.None;
+            currentUnderlineColor = null;
+        }
+
+        var toTurnOn = targetCell.Attributes & ~currentAttrs;
+
+        if ((toTurnOn & CellAttributes.Bold) != 0) AppendPartBytes(dest, ref pos, "1"u8);
+        if ((toTurnOn & CellAttributes.Dim) != 0) AppendPartBytes(dest, ref pos, "2"u8);
+        if ((toTurnOn & CellAttributes.Italic) != 0) AppendPartBytes(dest, ref pos, "3"u8);
+        if ((toTurnOn & CellAttributes.Underline) != 0)
+        {
+            AppendPartBytes(dest, ref pos, UnderlineSgrCodeBytes(targetCell.UnderlineStyle));
+        }
+        else if ((currentAttrs & CellAttributes.Underline) != 0 &&
+                 (targetCell.Attributes & CellAttributes.Underline) != 0 &&
+                 targetCell.UnderlineStyle != currentUnderlineStyle)
+        {
+            AppendPartBytes(dest, ref pos, UnderlineSgrCodeBytes(targetCell.UnderlineStyle));
+        }
+        if ((toTurnOn & CellAttributes.Blink) != 0) AppendPartBytes(dest, ref pos, "5"u8);
+        if ((toTurnOn & CellAttributes.Reverse) != 0) AppendPartBytes(dest, ref pos, "7"u8);
+        if ((toTurnOn & CellAttributes.Hidden) != 0) AppendPartBytes(dest, ref pos, "8"u8);
+        if ((toTurnOn & CellAttributes.Strikethrough) != 0) AppendPartBytes(dest, ref pos, "9"u8);
+        if ((toTurnOn & CellAttributes.Overline) != 0) AppendPartBytes(dest, ref pos, "53"u8);
+
+        if (!ColorsEqual(targetCell.Foreground, currentFg) && targetCell.Foreground is not null)
+        {
+            AppendSeparatorByte(dest, ref pos);
+            AppendColorSgrBytes(dest, ref pos, targetCell.Foreground.Value, isForeground: true);
+        }
+
+        if (!ColorsEqual(targetCell.Background, currentBg) && targetCell.Background is not null)
+        {
+            AppendSeparatorByte(dest, ref pos);
+            AppendColorSgrBytes(dest, ref pos, targetCell.Background.Value, isForeground: false);
+        }
+
+        if (!ColorsEqual(targetCell.UnderlineColor, currentUnderlineColor))
+        {
+            if (targetCell.UnderlineColor is not null)
+            {
+                var ulc = targetCell.UnderlineColor.Value;
+                AppendSeparatorByte(dest, ref pos);
+                AppendBytes(dest, ref pos, "58;2;"u8);
+                AppendByteAsAscii(dest, ref pos, ulc.R);
+                dest[pos++] = (byte)';';
+                AppendByteAsAscii(dest, ref pos, ulc.G);
+                dest[pos++] = (byte)';';
+                AppendByteAsAscii(dest, ref pos, ulc.B);
+            }
+            else if (currentUnderlineColor is not null)
+            {
+                AppendPartBytes(dest, ref pos, "59"u8);
+            }
+        }
+
+        currentAttrs = targetCell.Attributes;
+        currentFg = targetCell.Foreground;
+        currentBg = targetCell.Background;
+        currentUnderlineStyle = targetCell.UnderlineStyle;
+        currentUnderlineColor = targetCell.UnderlineColor;
+
+        return pos;
+    }
+
+    private static void AppendPartBytes(Span<byte> dest, ref int pos, ReadOnlySpan<byte> part)
+    {
+        AppendSeparatorByte(dest, ref pos);
+        AppendBytes(dest, ref pos, part);
+    }
+
+    private static void AppendSeparatorByte(Span<byte> dest, ref int pos)
+    {
+        if (pos > 0) dest[pos++] = (byte)';';
+    }
+
+    private static void AppendBytes(Span<byte> dest, ref int pos, ReadOnlySpan<byte> src)
+    {
+        src.CopyTo(dest.Slice(pos));
+        pos += src.Length;
+    }
+
+    private static void AppendIntAsAscii(Span<byte> dest, ref int pos, int value)
+    {
+        if (!System.Buffers.Text.Utf8Formatter.TryFormat(value, dest.Slice(pos), out var written))
+            throw new InvalidOperationException("SGR int formatting buffer overflow.");
+        pos += written;
+    }
+
+    private static void AppendByteAsAscii(Span<byte> dest, ref int pos, byte value)
+    {
+        if (!System.Buffers.Text.Utf8Formatter.TryFormat(value, dest.Slice(pos), out var written))
+            throw new InvalidOperationException("SGR byte formatting buffer overflow.");
+        pos += written;
+    }
+
+    private static ReadOnlySpan<byte> UnderlineSgrCodeBytes(UnderlineStyle style) => style switch
+    {
+        UnderlineStyle.Double => "21"u8,
+        UnderlineStyle.Curly => "4:3"u8,
+        UnderlineStyle.Dotted => "4:4"u8,
+        UnderlineStyle.Dashed => "4:5"u8,
+        _ => "4"u8,
+    };
+
+    private static void AppendColorSgrBytes(Span<byte> dest, ref int pos, Hex1bColor color, bool isForeground)
+    {
+        switch (color.Kind)
+        {
+            case Hex1bColorKind.Standard:
+                AppendIntAsAscii(dest, ref pos, isForeground ? 30 + color.AnsiIndex : 40 + color.AnsiIndex);
+                break;
+            case Hex1bColorKind.Bright:
+                AppendIntAsAscii(dest, ref pos, isForeground ? 90 + color.AnsiIndex : 100 + color.AnsiIndex);
+                break;
+            case Hex1bColorKind.Indexed:
+                AppendBytes(dest, ref pos, isForeground ? "38;5;"u8 : "48;5;"u8);
+                AppendByteAsAscii(dest, ref pos, color.AnsiIndex);
+                break;
+            default:
+                AppendBytes(dest, ref pos, isForeground ? "38;2;"u8 : "48;2;"u8);
+                AppendByteAsAscii(dest, ref pos, color.R);
+                dest[pos++] = (byte)';';
+                AppendByteAsAscii(dest, ref pos, color.G);
+                dest[pos++] = (byte)';';
+                AppendByteAsAscii(dest, ref pos, color.B);
+                break;
+        }
+    }
+
+    private static string UnderlineSgrCode(UnderlineStyle style) => style switch
+    {
+        UnderlineStyle.Double => "21",
+        UnderlineStyle.Curly => "4:3",
+        UnderlineStyle.Dotted => "4:4",
+        UnderlineStyle.Dashed => "4:5",
+        _ => "4",
+    };
+
+    private static void AppendColorSgr(StringBuilder sb, Hex1bColor color, bool isForeground)
+    {
+        switch (color.Kind)
+        {
+            case Hex1bColorKind.Standard:
+                sb.Append(isForeground ? 30 + color.AnsiIndex : 40 + color.AnsiIndex);
+                break;
+            case Hex1bColorKind.Bright:
+                sb.Append(isForeground ? 90 + color.AnsiIndex : 100 + color.AnsiIndex);
+                break;
+            case Hex1bColorKind.Indexed:
+                sb.Append(isForeground ? "38;5;" : "48;5;").Append(color.AnsiIndex);
+                break;
+            default:
+                sb.Append(isForeground ? "38;2;" : "48;2;")
+                  .Append(color.R).Append(';').Append(color.G).Append(';').Append(color.B);
+                break;
+        }
     }
 
     private static string BuildColorSgr(Hex1bColor color, bool isForeground)
     {
-        return color.Kind switch
-        {
-            Hex1bColorKind.Standard => (isForeground ? 30 + color.AnsiIndex : 40 + color.AnsiIndex).ToString(),
-            Hex1bColorKind.Bright => (isForeground ? 90 + color.AnsiIndex : 100 + color.AnsiIndex).ToString(),
-            Hex1bColorKind.Indexed => $"{(isForeground ? "38;5" : "48;5")};{color.AnsiIndex}",
-            _ => $"{(isForeground ? "38;2" : "48;2")};{color.R};{color.G};{color.B}"
-        };
+        var sb = new StringBuilder(16);
+        AppendColorSgr(sb, color, isForeground);
+        return sb.ToString();
     }
 
     #endregion

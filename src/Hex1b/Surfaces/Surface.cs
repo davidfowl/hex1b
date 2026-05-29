@@ -42,6 +42,19 @@ public sealed class Surface : ISurfaceSource
     private int _contentMinX;
     private int _contentMaxY = -1;
     private int _contentMinY;
+
+    // Latched flag indicating that at least one cell on this surface has a value
+    // that the fast diff path cannot safely ignore: wide/continuation cells,
+    // multi-codepoint graphemes, underline state, or tracked refs (sixel/kgp/hyperlink).
+    // When false, SurfaceComparer can use a slimmer per-cell equality that skips
+    // those checks entirely.
+    //
+    // The flag is intentionally permissive (latched-on-write, only reset by Clear/
+    // ClearAndReleaseTrackedObjects). A surface that briefly held complex content
+    // and then had it overwritten with simple content will keep the flag set until
+    // the next Clear — that just falls back to the slow path, never produces wrong
+    // diffs.
+    private bool _hasComplexContent;
     
     /// <summary>
     /// Gets the width of the surface in columns.
@@ -161,8 +174,8 @@ public sealed class Surface : ISurfaceSource
             // Track content bounding box
             if (value != SurfaceCells.Empty)
                 ExpandContentBounds(x, y);
-            
-            _cells[index] = value;
+
+            SetCellInternal(index, value);
         }
     }
 
@@ -222,8 +235,8 @@ public sealed class Surface : ISurfaceSource
             // Track content bounding box
             if (cell != SurfaceCells.Empty)
                 ExpandContentBounds(x, y);
-            
-            _cells[index] = cell;
+
+            SetCellInternal(index, cell);
             return true;
         }
         return false;
@@ -246,6 +259,7 @@ public sealed class Surface : ISurfaceSource
         Array.Fill(_cells, SurfaceCells.Empty);
         _sixelCount = 0;
         _kgpCount = 0;
+        _hasComplexContent = false;
         ResetContentBounds();
     }
 
@@ -270,6 +284,7 @@ public sealed class Surface : ISurfaceSource
 
         _sixelCount = 0;
         _kgpCount = 0;
+        _hasComplexContent = false;
         ResetContentBounds();
     }
 
@@ -282,6 +297,7 @@ public sealed class Surface : ISurfaceSource
         Array.Fill(_cells, cell);
         _sixelCount = cell.HasSixel ? CellCount : 0;
         _kgpCount = cell.HasKgp ? CellCount : 0;
+        _hasComplexContent = IsCellComplex(cell);
         if (cell != SurfaceCells.Empty && Width > 0 && Height > 0)
             SetContentBoundsToFull();
         else
@@ -307,6 +323,14 @@ public sealed class Surface : ISurfaceSource
             ExpandContentBounds(startX, startY);
             ExpandContentBounds(endX - 1, endY - 1);
         }
+
+        // Cell is loop-invariant, so we mark complexity once up-front
+        // rather than calling SetCellInternal per cell (which would
+        // re-check IsCellComplex on every iteration). The contract
+        // documented on SetCellInternal still holds because we mark
+        // before writing.
+        if (startX < endX && startY < endY)
+            MarkComplexIfNeeded(cell);
 
         for (var y = startY; y < endY; y++)
         {
@@ -392,7 +416,7 @@ public sealed class Surface : ISurfaceSource
                 while (currentX < Width)
                 {
                     if (startX < 0) startX = currentX;
-                    _cells[y * Width + currentX] = new SurfaceCell(" ", foreground, background, attributes, 1);
+                    SetCellInternal(y * Width + currentX, new SurfaceCell(" ", foreground, background, attributes, 1));
                     currentX++;
                     columnsWritten++;
                 }
@@ -402,7 +426,7 @@ public sealed class Surface : ISurfaceSource
             // Write the primary cell
             var cell = new SurfaceCell(grapheme, foreground, background, attributes, graphemeWidth);
             if (startX < 0) startX = currentX;
-            _cells[y * Width + currentX] = cell;
+            SetCellInternal(y * Width + currentX, cell);
             currentX++;
             columnsWritten++;
 
@@ -411,7 +435,7 @@ public sealed class Surface : ISurfaceSource
             {
                 if (currentX < Width)
                 {
-                    _cells[y * Width + currentX] = SurfaceCell.CreateContinuation(background);
+                    SetCellInternal(y * Width + currentX, SurfaceCell.CreateContinuation(background));
                     currentX++;
                     columnsWritten++;
                 }
@@ -442,7 +466,7 @@ public sealed class Surface : ISurfaceSource
         if (!IsInBounds(x, y))
             return false;
 
-        _cells[y * Width + x] = new SurfaceCell(character.ToString(), foreground, background, attributes, 1);
+        SetCellInternal(y * Width + x, new SurfaceCell(character.ToString(), foreground, background, attributes, 1));
         ExpandContentBounds(x, y);
         return true;
     }
@@ -461,11 +485,11 @@ public sealed class Surface : ISurfaceSource
             var cell = _cells[i];
             if (cell == SurfaceCells.Empty)
             {
-                _cells[i] = bgCell;
+                SetCellInternal(i, bgCell);
             }
             else if (cell.HasTransparentBackground)
             {
-                _cells[i] = cell with { Background = background };
+                SetCellInternal(i, cell with { Background = background });
             }
         }
         // After FillBackground, every cell has content (either rendered or bgCell)
@@ -500,11 +524,11 @@ public sealed class Surface : ISurfaceSource
                 var cell = _cells[i];
                 if (cell == SurfaceCells.Empty)
                 {
-                    _cells[i] = bgCell;
+                    SetCellInternal(i, bgCell);
                 }
                 else if (cell.HasTransparentBackground)
                 {
-                    _cells[i] = cell with { Background = background };
+                    SetCellInternal(i, cell with { Background = background });
                 }
             }
         }
@@ -622,7 +646,7 @@ public sealed class Surface : ISurfaceSource
                 else if (!oldCell.HasKgp && srcCell.HasKgp)
                     _kgpCount++;
 
-                _cells[index] = srcCell;
+                SetCellInternal(index, srcCell);
                 ExpandContentBounds(destX, destY);
             }
         }
@@ -844,6 +868,64 @@ public sealed class Surface : ISurfaceSource
     /// (e.g., in async contexts). Use with caution - no bounds checking.
     /// </remarks>
     internal SurfaceCell[] CellsUnsafe => _cells;
+
+    /// <summary>
+    /// Gets whether this surface contains only cells that the diff fast path can
+    /// safely treat as 4-field (Character/Foreground/Background/Attributes) cells.
+    /// </summary>
+    /// <remarks>
+    /// False when at least one cell was written with a wide/continuation display width,
+    /// a multi-codepoint grapheme, an underline style/colour, or a tracked sixel/KGP/
+    /// hyperlink reference. The flag is permissive: once set it stays set until the
+    /// next <see cref="Clear()"/> or <see cref="ClearAndReleaseTrackedObjects"/>.
+    /// A false negative just falls back to the slow path; it can never produce a
+    /// wrong diff.
+    /// </remarks>
+    internal bool IsFastPathEligible => !_hasComplexContent;
+
+    /// <summary>
+    /// True if <paramref name="cell"/> has any property that the fast diff path
+    /// cannot ignore: a non-default display width, a multi-codepoint grapheme,
+    /// an underline style or colour, or any tracked reference.
+    /// </summary>
+    private static bool IsCellComplex(in SurfaceCell cell)
+    {
+        if (cell.DisplayWidth != 1) return true;
+        if (cell.UnderlineStyle != UnderlineStyle.None) return true;
+        if (cell.UnderlineColor.HasValue) return true;
+        if (cell.Sixel is not null) return true;
+        if (cell.Kgp is not null) return true;
+        if (cell.Hyperlink is not null) return true;
+        var character = cell.Character;
+        if (character is not null && character.Length > 1) return true;
+        return false;
+    }
+
+    private void MarkComplexIfNeeded(in SurfaceCell cell)
+    {
+        if (!_hasComplexContent && IsCellComplex(cell))
+            _hasComplexContent = true;
+    }
+
+    /// <summary>
+    /// The single internal entry point for storing a <see cref="SurfaceCell"/> into the
+    /// backing array. Every direct <c>_cells[index] = cell</c> site MUST go through this
+    /// helper so that <see cref="_hasComplexContent"/> stays in sync with the cell data —
+    /// otherwise the diff fast path in <see cref="SurfaceComparer"/> can silently drop
+    /// underline / wide-cell / grapheme / tracked-ref changes.
+    /// </summary>
+    /// <remarks>
+    /// Bounds tracking, sixel/KGP refcount maintenance, and content-bounds expansion
+    /// remain the caller's responsibility — they are context-dependent (e.g. <c>Fill</c>
+    /// hoists them out of the loop). The complex-flag bookkeeping is the only invariant
+    /// this helper enforces, because forgetting it is a correctness escape valve rather
+    /// than a perf hit.
+    /// </remarks>
+    private void SetCellInternal(int index, in SurfaceCell cell)
+    {
+        MarkComplexIfNeeded(cell);
+        _cells[index] = cell;
+    }
 
     private void ValidateBounds(int x, int y)
     {

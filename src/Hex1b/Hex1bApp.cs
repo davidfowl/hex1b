@@ -159,6 +159,36 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     // Surface rendering double-buffer
     private Surface? _currentSurface;
     private Surface? _previousSurface;
+    // Renderer hot-path pools — reused across frames so SurfaceComparer doesn't
+    // allocate a fresh diff/list of changed cells or a fresh token list every frame.
+    private readonly Surfaces.SurfaceDiff _frameDiff = new();
+    // Token lists are rotated through a small pool so that a list shipped to the
+    // terminal-side consumer (via the workload channel) can continue to be enumerated
+    // even after the producer starts building the next frame. Without this, the
+    // producer would mutate the list while the consumer iterates it. The consumer
+    // returns the list via WorkloadOutputItem.PooledTokens once it's done.
+    private readonly System.Collections.Concurrent.ConcurrentStack<List<Tokens.AnsiToken>> _tokenListPool = new();
+    private List<Tokens.AnsiToken>? _frameTokens;
+    // Used only when KGP placements need to be interleaved with text tokens; reused to
+    // avoid a per-frame scratch allocation when KGP is active. Not shipped across the
+    // channel — only used to assemble the merged list — so single-buffering is safe.
+    private readonly List<Tokens.AnsiToken> _frameKgpScratchTokens = new();
+
+    private List<Tokens.AnsiToken> RentTokenList()
+    {
+        if (_tokenListPool.TryPop(out var list))
+        {
+            list.Clear();
+            return list;
+        }
+        return new List<Tokens.AnsiToken>();
+    }
+
+    internal void ReturnTokenList(List<Tokens.AnsiToken> list)
+    {
+        list.Clear();
+        _tokenListPool.Push(list);
+    }
     
     // KGP placement lifecycle tracker (persists across frames)
     private readonly Kgp.KgpPlacementTracker _kgpTracker = new();
@@ -187,6 +217,13 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     
     // Animation timer for RedrawAfter() support
     private readonly AnimationTimer _animationTimer;
+
+    // Minimum interval between rendered frames (paces the render loop, not just Schedule()).
+    private readonly TimeSpan _frameRateLimit;
+    // Timestamp of the last frame actually rendered. Used by the render loop
+    // to enforce _frameRateLimit so invalidations triggered faster than the
+    // configured cadence get coalesced into a single render.
+    private long _lastRenderTimestamp;
     
     // Window manager registry for accessing WindowManagers from anywhere
     private readonly WindowManagerRegistry _windowManagerRegistry = new();
@@ -227,6 +264,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         // Create animation timer with configured frame rate limit
         var frameRateLimitMs = Math.Max(1, options.FrameRateLimitMs);
         _animationTimer = new AnimationTimer(TimeSpan.FromMilliseconds(frameRateLimitMs));
+        _frameRateLimit = TimeSpan.FromMilliseconds(frameRateLimitMs);
         
         // Check if mouse is enabled in options
         _mouseEnabled = options.EnableMouse;
@@ -527,7 +565,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                         await ProcessInputEventAsync(inputEvent, cancellationToken);
                     }
                     
-                    // Input coalescing: batch rapid inputs together before rendering
+                    // Input coalescing: batch rapid inputs together before rendering.
                     if (_enableInputCoalescing)
                     {
                         var outputBacklog = _adapter.OutputQueueDepth;
@@ -535,7 +573,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                             _inputCoalescingInitialDelayMs + (outputBacklog * 10), 
                             _inputCoalescingMaxDelayMs);
                         await Task.Delay(coalescingDelayMs, cancellationToken);
-                    
+
                         while (_adapter.InputEvents.TryRead(out var delayedInput))
                         {
                             await ProcessInputEventAsync(delayedInput, cancellationToken);
@@ -556,8 +594,16 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                     }
                 }
 
-                // Re-render after handling input or invalidation (state may have changed)
+                // Re-render after handling input or invalidation (state may have changed).
+                // Skip the frame-rate pace whenever input was processed - inputs are user-driven
+                // and shouldn't be rate-limited (would starve a fast typist at one keystroke
+                // per FrameRateLimitMs). Pacing applies only to timer/invalidation-driven frames.
+                if (!inputReady)
+                {
+                    await PaceFrameAsync(cancellationToken);
+                }
                 await RenderFrameAsync(cancellationToken);
+                _lastRenderTimestamp = Stopwatch.GetTimestamp();
                 
                 // IMPORTANT: Handle race condition where output arrived during render.
                 // If invalidation was signaled while we were rendering, we need to re-render
@@ -568,6 +614,13 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                 
                 while (_invalidateChannel.Reader.TryRead(out _) && extraRenders < maxExtraRenders)
                 {
+                    // If we're already inside the frame budget, defer remaining invalidations
+                    // to the next outer iteration so the render loop honors FrameRateLimitMs.
+                    var elapsedSinceLastRender = TimeSpan.FromSeconds(
+                        (Stopwatch.GetTimestamp() - _lastRenderTimestamp) / (double)Stopwatch.Frequency);
+                    if (elapsedSinceLastRender < _frameRateLimit)
+                        break;
+
                     // ALWAYS process pending input before each re-render to prevent starvation
                     while (_adapter.InputEvents.TryRead(out var pendingEvent))
                     {
@@ -583,6 +636,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                     _animationTimer.FireDue();
                         
                     await RenderFrameAsync(cancellationToken);
+                    _lastRenderTimestamp = Stopwatch.GetTimestamp();
                     extraRenders++;
                 }
                 
@@ -796,6 +850,30 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
             (Stopwatch.GetTimestamp() - inputStart) * 1000.0 / Stopwatch.Frequency);
     }
 
+    /// <summary>
+    /// Sleeps until the configured per-frame minimum interval has elapsed since
+    /// the last rendered frame, so invalidations triggered faster than
+    /// <see cref="Hex1bAppOptions.FrameRateLimitMs"/> are coalesced.
+    /// </summary>
+    private async Task PaceFrameAsync(CancellationToken cancellationToken)
+    {
+        if (_lastRenderTimestamp == 0)
+            return;
+        var elapsed = TimeSpan.FromSeconds((Stopwatch.GetTimestamp() - _lastRenderTimestamp) / (double)Stopwatch.Frequency);
+        var remaining = _frameRateLimit - elapsed;
+        if (remaining > TimeSpan.Zero)
+        {
+            try
+            {
+                await Task.Delay(remaining, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Caller handles cancellation
+            }
+        }
+    }
+
     private async Task RenderFrameAsync(CancellationToken cancellationToken)
     {
         // NOTE: We intentionally do NOT clear animation timers here.
@@ -961,7 +1039,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                 {
                     long renderFrameStart = Stopwatch.GetTimestamp();
                     
-                    wroteOutput = RenderFrameWithSurface(frameWidth, frameHeight, frameCapabilities);
+                    wroteOutput = await RenderFrameWithSurfaceAsync(frameWidth, frameHeight, frameCapabilities, cancellationToken).ConfigureAwait(false);
                     
                     renderTicks = Stopwatch.GetTimestamp() - renderFrameStart;
                     if (_diagnosticTimingEnabled) _diagRenderTicks = renderTicks;
@@ -1024,8 +1102,17 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     /// Callers use this to know whether the hardware cursor may have been moved by
     /// the emitted tokens.
     /// </returns>
-    private bool RenderFrameWithSurface(int width, int height, TerminalCapabilities caps)
+    private async ValueTask<bool> RenderFrameWithSurfaceAsync(int width, int height, TerminalCapabilities caps, CancellationToken cancellationToken)
     {
+        var result = RenderFrameWithSurfaceCore(width, height, caps, out var asyncWriteWork);
+        if (asyncWriteWork != null)
+            await asyncWriteWork(cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    private bool RenderFrameWithSurfaceCore(int width, int height, TerminalCapabilities caps, out Func<CancellationToken, ValueTask>? asyncWriteWork)
+    {
+        asyncWriteWork = null;
         _surfacePool?.NextFrame();
         
         // Get cell metrics from terminal capabilities
@@ -1148,12 +1235,24 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
             return true;
         }
 
-        // Diff current vs previous and emit changes
+        // Diff current vs previous and emit changes. _frameDiff is a pooled
+        // SurfaceDiff reused every frame to avoid the List<ChangedCell> growth cost.
         var diffStart = Stopwatch.GetTimestamp();
-        var diff = _isFirstFrame || _previousSurface == null
-            ? SurfaceComparer.CompareToEmpty(_currentSurface)
-            : SurfaceComparer.Compare(_previousSurface, _currentSurface);
+        bool fastPathTaken;
+        if (_isFirstFrame || _previousSurface == null)
+        {
+            fastPathTaken = SurfaceComparer.CompareToEmptyInto(_currentSurface, _frameDiff);
+        }
+        else
+        {
+            fastPathTaken = SurfaceComparer.CompareInto(_previousSurface, _currentSurface, _frameDiff);
+        }
+        var diff = _frameDiff;
         _metrics.SurfaceDiffDuration.Record(Stopwatch.GetElapsedTime(diffStart).TotalMilliseconds);
+        if (fastPathTaken)
+            _metrics.SurfaceDiffFastPathCount.Add(1);
+        else
+            _metrics.SurfaceDiffSlowPathCount.Add(1);
         
         _metrics.OutputCellsChanged.Record(diff.Count);
         
@@ -1198,42 +1297,111 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         
         if (wroteOutput)
         {
-            // Generate text/sixel tokens (KGP emission skipped — handled by tracker above)
+            // Token-list pool ownership protocol:
+            //   1. Rent a list from _tokenListPool.
+            //   2. Fill it via ToTokensInto.
+            //   3. On the happy path, transfer ownership to the consumer via
+            //      WriteTokensWithBytesAsync; the consumer returns it once
+            //      it has finished iterating.
+            //   4. On any throw before step 3 completes, the finally below
+            //      returns the list and any rented ANSI buffer to their pools
+            //      so we don't slowly bleed pool capacity on error paths.
+            //
+            // The pooled output buffer is similarly owned by this scope until
+            // it crosses into the WorkloadOutputItem; we then null both locals
+            // so the finally is a no-op on the success path.
             var tokensStart = Stopwatch.GetTimestamp();
-            var textTokens = diff.IsEmpty
-                ? Array.Empty<Tokens.AnsiToken>()
-                : SurfaceComparer.ToTokens(diff, _currentSurface, _previousSurface, skipKgpEmission: hasKgp);
-            _metrics.SurfaceTokensDuration.Record(Stopwatch.GetElapsedTime(tokensStart).TotalMilliseconds);
-            
-            // Merge: KGP before-text + text tokens + KGP after-text
-            List<Tokens.AnsiToken> tokens;
-            if (hasKgpChanges)
+            _frameTokens = RentTokenList();
+            byte[]? pooledOutput = null;
+            var ownershipTransferred = false;
+            try
             {
-                tokens = new List<Tokens.AnsiToken>(kgpBefore.Count + textTokens.Count + kgpAfter.Count);
-                tokens.AddRange(kgpBefore);
-                tokens.AddRange(textTokens);
-                tokens.AddRange(kgpAfter);
+                if (hasKgpChanges)
+                {
+                    _frameTokens.AddRange(kgpBefore);
+                    if (!diff.IsEmpty)
+                    {
+                        var scratch = _frameKgpScratchTokens;
+                        SurfaceComparer.ToTokensInto(diff, _currentSurface, _previousSurface, skipKgpEmission: true, scratch);
+                        _frameTokens.AddRange(scratch);
+                    }
+                    _frameTokens.AddRange(kgpAfter);
+                }
+                else if (!diff.IsEmpty)
+                {
+                    SurfaceComparer.ToTokensInto(diff, _currentSurface, _previousSurface, skipKgpEmission: hasKgp, _frameTokens);
+                }
+                var tokens = _frameTokens;
+                _metrics.SurfaceTokensDuration.Record(Stopwatch.GetElapsedTime(tokensStart).TotalMilliseconds);
+
+                var serializeStart = Stopwatch.GetTimestamp();
+                // Use the pool-backed serializer so the per-frame ANSI byte buffer (often
+                // well over the 85 KB LOH threshold for fullscreen renders) is rented from
+                // ArrayPool rather than allocated fresh on the LOH every frame.
+                ReadOnlyMemory<byte> ansiOutput;
+                if (_adapter is Hex1bAppWorkloadAdapter)
+                {
+                    ansiOutput = Tokens.AnsiTokenUtf8Serializer.SerializeRented(tokens, out pooledOutput);
+                }
+                else
+                {
+                    ansiOutput = Tokens.AnsiTokenUtf8Serializer.Serialize(tokens);
+                }
+                _metrics.SurfaceSerializeDuration.Record(Stopwatch.GetElapsedTime(serializeStart).TotalMilliseconds);
+
+                if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
+                {
+                    // Transfer ownership of the pooled token list AND the rented
+                    // byte buffer to the consumer; capture them into locals so the
+                    // async continuation can reference them, and null the field /
+                    // local so the finally below treats this as a successful handoff.
+                    var ownedTokens = _frameTokens;
+                    var ownedPooledOutput = pooledOutput;
+                    _frameTokens = null;
+                    pooledOutput = null;
+                    ownershipTransferred = true;
+
+                    asyncWriteWork = ct => workloadAdapter.WriteTokensWithBytesAsync(
+                        tokens,
+                        ansiOutput,
+                        ownedPooledOutput,
+                        ownedTokens,
+                        ReturnTokenList,
+                        ct);
+                }
+                else
+                {
+                    _adapter.Write(ansiOutput);
+                    // No workload-channel consumer: return the rented list here.
+                    if (_frameTokens is { } own)
+                    {
+                        _frameTokens = null;
+                        ReturnTokenList(own);
+                    }
+                    ownershipTransferred = true;
+                }
+
+                _metrics.OutputTokens.Record(tokens.Count);
+                _metrics.OutputBytes.Record(ansiOutput.Length);
             }
-            else
+            finally
             {
-                tokens = textTokens is List<Tokens.AnsiToken> list ? list : new List<Tokens.AnsiToken>(textTokens);
+                if (!ownershipTransferred)
+                {
+                    // Some step between rent and handoff threw. Return everything we
+                    // still own so the pools don't slowly bleed capacity.
+                    if (_frameTokens is { } orphaned)
+                    {
+                        _frameTokens = null;
+                        ReturnTokenList(orphaned);
+                    }
+                    if (pooledOutput is not null)
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(pooledOutput);
+                        pooledOutput = null;
+                    }
+                }
             }
-            
-            var serializeStart = Stopwatch.GetTimestamp();
-            var ansiOutput = Tokens.AnsiTokenUtf8Serializer.Serialize(tokens);
-            _metrics.SurfaceSerializeDuration.Record(Stopwatch.GetElapsedTime(serializeStart).TotalMilliseconds);
-            
-            if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
-            {
-                workloadAdapter.WriteTokensWithBytes(tokens, ansiOutput);
-            }
-            else
-            {
-                _adapter.Write(ansiOutput);
-            }
-            
-            _metrics.OutputTokens.Record(tokens.Count);
-            _metrics.OutputBytes.Record(ansiOutput.Length);
         }
         
         _isFirstFrame = false;
