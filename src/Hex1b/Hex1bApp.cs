@@ -280,13 +280,23 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         {
             // Default: create console terminal using new architecture
             var presentation = new ConsolePresentationAdapter(enableMouse: _mouseEnabled);
-            var workload = new Hex1bAppWorkloadAdapter(presentation);
+            var workload = new Hex1bAppWorkloadAdapter(presentation) { EnableMouse = _mouseEnabled };
             _ownedTerminal = new Hex1bTerminal(new Hex1bTerminalOptions
             {
                 PresentationAdapter = presentation,
                 WorkloadAdapter = workload
             });
             _adapter = workload;
+        }
+
+        // Propagate the app's mouse-enabled option into a pre-built Hex1bAppWorkloadAdapter
+        // so it doesn't emit DECSET 1003h/1006h in EnterTuiMode unless this app actually
+        // wants mouse input. Important for embedded scenarios (e.g. placeholder inside a
+        // TerminalWidget) where those bytes would otherwise flip the host's mouse-tracking
+        // flag and persist after the placeholder is swapped out.
+        if (_adapter is Hex1bAppWorkloadAdapter appAdapter)
+        {
+            appAdapter.EnableMouse = _mouseEnabled;
         }
         
         var initialTheme = options.ThemeProvider?.Invoke() ?? options.Theme;
@@ -494,6 +504,19 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         {
             workloadAdapter.DiagnosticTreeProvider = this;
             _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
+            // Wire IRepaintableWorkloadAdapter: when an outer multiplexer
+            // (e.g. PlaceholderWorkloadAdapter) tells us the surrounding
+            // terminal state was reset out from under us, flip _isFirstFrame
+            // and invalidate so the next frame is a full repaint.
+            workloadAdapter.SetRepaintRequestHandler(() =>
+            {
+                _isFirstFrame = true;
+                _lastRenderedCursorX = -1;
+                _lastRenderedCursorY = -1;
+                _lastRenderedCursorVisible = false;
+                _lastRenderedCursorNode = null;
+                Invalidate();
+            });
         }
         
         _context.EnterAlternateScreen();
@@ -672,6 +695,14 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         {
             // Always exit alternate buffer, even on error
             _context.ExitAlternateScreen();
+
+            // Drop the repaint handler so we don't keep this app alive via
+            // the workload adapter's delegate slot if RunAsync is restarted
+            // or the host swaps adapters.
+            if (_adapter is Hex1bAppWorkloadAdapter wa)
+            {
+                wa.SetRepaintRequestHandler(null);
+            }
         }
     }
 

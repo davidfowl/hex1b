@@ -34,7 +34,7 @@ namespace Hex1b;
 /// await app.RunAsync();
 /// </code>
 /// </example>
-public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, IHex1bTerminalTokenWorkloadAdapter, IDisposable
+public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, IHex1bTerminalTokenWorkloadAdapter, IRepaintableWorkloadAdapter, IDisposable
 {
     private readonly Channel<WorkloadOutputItem> _outputChannel;
     private readonly Channel<Hex1bEvent> _inputChannel;
@@ -53,12 +53,46 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     /// Set by Hex1bApp when it starts running.
     /// </summary>
     internal Diagnostics.IDiagnosticTreeProvider? DiagnosticTreeProvider { get; set; }
+
+    // Callback installed by Hex1bApp.RunAsync so an outer multiplexer
+    // (e.g. PlaceholderWorkloadAdapter) can ask the app to drop diff
+    // state and emit a full screen on the next frame. Null until the
+    // owning Hex1bApp has started running.
+    private Action? _repaintRequestHandler;
+
+    /// <summary>
+    /// Installs the callback invoked by <see cref="RequestFullRepaint"/>.
+    /// Owned by <see cref="Hex1bApp"/>; set once when the app starts and
+    /// cleared on dispose. Internal because the wiring is between the
+    /// adapter and its owning Hex1bApp — external callers should go
+    /// through <see cref="IRepaintableWorkloadAdapter.RequestFullRepaint"/>.
+    /// </summary>
+    internal void SetRepaintRequestHandler(Action? handler) => _repaintRequestHandler = handler;
+
+    /// <inheritdoc />
+    public void RequestFullRepaint() => _repaintRequestHandler?.Invoke();
     
     /// <summary>
     /// When true, Hex1bApp collects per-node timing metrics during reconcile and render.
     /// Set by the terminal builder when WithDiagnostics() is applied.
     /// </summary>
     internal bool DiagnosticTimingEnabled { get; set; }
+
+    /// <summary>
+    /// When true, <see cref="EnterTuiMode"/> emits the DECSET sequences to enable mouse
+    /// tracking (1003) and SGR coordinates (1006), and <see cref="ExitTuiMode"/> emits
+    /// the matching DECRST sequences. When false (default) the mouse-enable bytes are
+    /// suppressed even if <see cref="TerminalCapabilities.SupportsMouse"/> is true.
+    /// <para>
+    /// This is important when the adapter is composed inside a host terminal
+    /// (for example, as the placeholder inside a <c>TerminalWidget</c>) — unconditional
+    /// mouse-enable would flip the host's mouse-tracking flag, which would then forward
+    /// host mouse events into the embedded workload even after a later swap that has
+    /// no opportunity to emit a DECRST.
+    /// </para>
+    /// Set by <see cref="Hex1bApp"/> from its <see cref="Hex1bAppOptions.EnableMouse"/>.
+    /// </summary>
+    public bool EnableMouse { get; set; }
 
     /// <summary>
     /// Creates a new app workload adapter.
@@ -392,7 +426,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
         var sb = new StringBuilder();
         sb.Append("\x1b[?1049h");  // Enter alternate screen
         sb.Append("\x1b[?25l");    // Hide cursor
-        if (Capabilities.SupportsMouse)
+        if (EnableMouse && Capabilities.SupportsMouse)
         {
             sb.Append("\x1b[?1003h");  // Enable mouse tracking
             sb.Append("\x1b[?1006h");  // SGR mouse mode
@@ -417,7 +451,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
         {
             sb.Append("\x1b[?2004l");  // Disable bracketed paste mode
         }
-        if (Capabilities.SupportsMouse)
+        if (EnableMouse && Capabilities.SupportsMouse)
         {
             sb.Append("\x1b[?1006l");  // Disable SGR mouse mode
             sb.Append("\x1b[?1003l");  // Disable mouse tracking
