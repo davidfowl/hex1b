@@ -1,25 +1,52 @@
+using System.Collections.Specialized;
+using Hex1b.Composition;
+using Hex1b.Data;
+using Hex1b.Events;
 using Hex1b.Input;
 using Hex1b.Layout;
+using Hex1b.Nodes;
 using Hex1b.Theming;
 using Hex1b.Widgets;
 
 namespace Hex1b;
 
-public sealed class ListNode : Hex1bNode
+/// <summary>
+/// Render node for <see cref="ListWidget{T}"/>. Supports two render modes:
+/// <list type="bullet">
+///   <item>
+///     <description>
+///       <b>Default mode</b> — no <c>ItemTemplate</c> set: each row is rendered
+///       as a single line of <c>item?.ToString()</c> with the themed selection
+///       indicator and selected/hover background, identical to the original
+///       <see cref="ListNode"/> visuals.
+///     </description>
+///   </item>
+///   <item>
+///     <description>
+///       <b>Template mode</b> — <c>ItemTemplate</c> set: each row is reconciled
+///       into a child widget tree the template returns. The template owns all
+///       visual chrome and styles itself from
+///       <see cref="ListItemContext{T}"/>.
+///     </description>
+///   </item>
+/// </list>
+/// </summary>
+/// <typeparam name="T">The item type of the list.</typeparam>
+public class ListNode<T> : Hex1bNode, ILayoutProvider
 {
     /// <summary>
     /// The source widget that was reconciled into this node.
     /// </summary>
-    public ListWidget? SourceWidget { get; set; }
+    public ListWidget<T>? SourceWidget { get; set; }
 
-    private IReadOnlyList<string> _items = [];
+    private IReadOnlyList<T> _items = [];
     /// <summary>
     /// The list items to display.
     /// </summary>
-    public IReadOnlyList<string> Items 
-    { 
-        get => _items; 
-        set 
+    public IReadOnlyList<T> Items
+    {
+        get => _items;
+        set
         {
             if (!ItemsEqual(_items, value))
             {
@@ -28,49 +55,63 @@ public sealed class ListNode : Hex1bNode
             }
         }
     }
-    
-    /// <summary>
-    /// Compares two item lists for content equality.
-    /// This prevents unnecessary dirty marking when the same items are passed as a new list.
-    /// </summary>
-    private static bool ItemsEqual(IReadOnlyList<string> a, IReadOnlyList<string> b)
+
+    private static bool ItemsEqual(IReadOnlyList<T> a, IReadOnlyList<T> b)
     {
         if (ReferenceEquals(a, b)) return true;
         if (a.Count != b.Count) return false;
+        var comparer = EqualityComparer<T>.Default;
         for (int i = 0; i < a.Count; i++)
         {
-            if (a[i] != b[i]) return false;
+            if (!comparer.Equals(a[i], b[i])) return false;
         }
         return true;
     }
 
+    private int _itemHeight = 1;
     /// <summary>
-    /// The currently selected index. This is preserved across reconciliation.
+    /// The fixed row height in terminal rows. Defaults to 1. Always at least 1.
     /// </summary>
-    private int _selectedIndex = 0;
-    public int SelectedIndex 
-    { 
-        get => _selectedIndex; 
-        set 
+    public int ItemHeight
+    {
+        get => _itemHeight;
+        set
         {
-            if (_selectedIndex != value)
+            var clamped = Math.Max(1, value);
+            if (_itemHeight != clamped)
             {
-                _selectedIndex = value;
-                EnsureSelectionVisible();
+                _itemHeight = clamped;
                 MarkDirty();
             }
         }
     }
 
+    private int _focusedIndex = 0;
     /// <summary>
-    /// The scroll offset (index of the first visible item).
-    /// This is preserved across reconciliation.
+    /// The currently selected index. Preserved across reconciliation.
     /// </summary>
+    public int FocusedIndex
+    {
+        get => _focusedIndex;
+        set
+        {
+            if (_focusedIndex != value)
+            {
+                _focusedIndex = value;
+                EnsureFocusVisible();
+                MarkDirty();
+            }
+        }
+    }
+
     private int _scrollOffset = 0;
-    public int ScrollOffset 
-    { 
-        get => _scrollOffset; 
-        set 
+    /// <summary>
+    /// The scroll offset (index of the first visible item). Preserved across reconciliation.
+    /// </summary>
+    public int ScrollOffset
+    {
+        get => _scrollOffset;
+        set
         {
             var clamped = Math.Clamp(value, 0, MaxScrollOffset);
             if (_scrollOffset != clamped)
@@ -82,43 +123,414 @@ public sealed class ListNode : Hex1bNode
     }
 
     /// <summary>
-    /// The number of visible rows in the viewport (set during Arrange).
+    /// The viewport height in terminal rows (set during Arrange).
     /// </summary>
     private int _viewportHeight = 0;
     public int ViewportHeight => _viewportHeight;
 
     /// <summary>
-    /// The maximum scroll offset based on item count and viewport height.
+    /// The number of items that fit in the viewport at the current <see cref="ItemHeight"/>.
     /// </summary>
-    public int MaxScrollOffset => Math.Max(0, Items.Count - _viewportHeight);
+    public int VisibleItemCount => Math.Max(0, _viewportHeight / Math.Max(1, _itemHeight));
 
     /// <summary>
-    /// Whether the list needs scrolling (more items than viewport height).
+    /// The maximum scroll offset based on item count and visible item count.
     /// </summary>
-    public bool IsScrollable => Items.Count > _viewportHeight && _viewportHeight > 0;
+    public int MaxScrollOffset => Math.Max(0, EffectiveItemCount - VisibleItemCount);
 
     /// <summary>
-    /// The text of the currently selected item, or null if the list is empty.
+    /// Whether the list needs scrolling (more items than fit in the viewport).
     /// </summary>
-    public string? SelectedText => SelectedIndex >= 0 && SelectedIndex < Items.Count 
-        ? Items[SelectedIndex] 
-        : null;
+    public bool IsScrollable => EffectiveItemCount > VisibleItemCount && VisibleItemCount > 0;
+
+    /// <summary>
+    /// The currently selected item, or <c>default</c> if the list is empty or
+    /// the selected row hasn't been loaded yet (virtualized mode).
+    /// </summary>
+    public T? FocusedItem
+    {
+        get
+        {
+            if (FocusedIndex < 0 || FocusedIndex >= EffectiveItemCount) return default;
+            return TryGetEffectiveItem(FocusedIndex, out var item) ? item : default;
+        }
+    }
+
+    /// <summary>
+    /// The text of the currently selected item (via <see cref="object.ToString"/>),
+    /// or <c>null</c> if the list is empty / not yet loaded.
+    /// </summary>
+    public string? FocusedText
+    {
+        get
+        {
+            if (FocusedIndex < 0 || FocusedIndex >= EffectiveItemCount) return null;
+            return TryGetEffectiveItem(FocusedIndex, out var item)
+                ? item?.ToString() ?? string.Empty
+                : null;
+        }
+    }
+
+    private int _hoveredItemIndex = -1;
+    /// <summary>
+    /// The index of the row currently under the mouse cursor, or -1 if the list
+    /// isn't hovered or the cursor sits past the last item. Updated by
+    /// <see cref="OnHoverMove"/> and reset to -1 when <see cref="IsHovered"/>
+    /// flips to false.
+    /// </summary>
+    public int HoveredItemIndex
+    {
+        get => _hoveredItemIndex;
+        private set
+        {
+            if (_hoveredItemIndex != value)
+            {
+                _hoveredItemIndex = value;
+                MarkDirty();
+            }
+        }
+    }
+
+    internal Func<ListItemContext<T>, Hex1bWidget>? ItemTemplate { get; set; }
+    internal Func<T, object>? ItemKeySelector { get; set; }
+
+    /// <summary>
+    /// Reconciled per-row child nodes. In non-virtualized mode this holds one
+    /// node per item (<c>ItemNodes[i]</c> corresponds to absolute index <c>i</c>).
+    /// In virtualized mode this holds only the window
+    /// <c>[ItemNodesWindowStart, ItemNodesWindowStart + ItemNodes.Count)</c>;
+    /// callers must map absolute indices through
+    /// <see cref="TryGetItemNode(int, out Hex1bNode)"/>.
+    /// </summary>
+    internal List<Hex1bNode> ItemNodes { get; set; } = new();
+
+    /// <summary>
+    /// Absolute item index that <c>ItemNodes[0]</c> corresponds to. Always 0 in
+    /// non-virtualized mode.
+    /// </summary>
+    internal int ItemNodesWindowStart { get; set; } = 0;
+
+    /// <summary>
+    /// Optional builder for an "empty state" widget rendered in place of the
+    /// list contents when the list is genuinely empty after data has loaded.
+    /// Wired by <see cref="ListWidget{T}.Empty(Func{RootContext, Hex1bWidget})"/>.
+    /// </summary>
+    internal Func<RootContext, Hex1bWidget>? EmptyBuilder { get; set; }
+
+    /// <summary>
+    /// Reconciled child node for the empty-state widget. Owned by the widget's
+    /// reconcile pass; <c>null</c> when no empty builder is set or while data is
+    /// still loading.
+    /// </summary>
+    internal Hex1bNode? EmptyChildNode { get; set; }
+
+    /// <summary>
+    /// True once the item count is known (always true for in-memory lists; for
+    /// virtualized sources, true after the first <see cref="LoadDataAsync"/>
+    /// completes). Used to gate the empty-state widget so it doesn't flash
+    /// while a data source is still resolving.
+    /// </summary>
+    public bool HasLoadedCount => !IsVirtualized || _cachedItemCount.HasValue;
+
+    /// <summary>
+    /// Whether the empty-state widget should currently be shown. True when the
+    /// item count is known AND zero.
+    /// </summary>
+    internal bool ShouldShowEmptyState => HasLoadedCount && EffectiveItemCount == 0;
+
+    /// <summary>
+    /// Attempts to resolve the templated child node for an absolute item index.
+    /// Returns <c>false</c> for indices outside the currently materialized
+    /// window (only possible under virtualization).
+    /// </summary>
+    internal bool TryGetItemNode(int absoluteIndex, out Hex1bNode node)
+    {
+        var offset = absoluteIndex - ItemNodesWindowStart;
+        if (offset >= 0 && offset < ItemNodes.Count)
+        {
+            node = ItemNodes[offset];
+            return true;
+        }
+        node = null!;
+        return false;
+    }
+
+    #region Virtualized data source
+
+    /// <summary>Buffer of rows above/below the visible viewport to pre-load.</summary>
+    internal const int VirtualizationBuffer = 5;
+
+    private IListDataSource<T>? _dataSource;
+    private INotifyCollectionChanged? _subscribedDataSource;
+    private IReadOnlyList<T>? _cachedItems;
+    private int? _cachedItemCount;
+    private (int Start, int End)? _cachedRange;
+    private CancellationTokenSource? _loadCts;
+
+    /// <summary>
+    /// Optional virtualized data source. When set, <see cref="Items"/> is
+    /// ignored and the node materialises only a window of items around the
+    /// visible viewport on each frame. Subscribes to
+    /// <see cref="INotifyCollectionChanged"/> if the source supports it.
+    /// </summary>
+    public IListDataSource<T>? DataSource
+    {
+        get => _dataSource;
+        set
+        {
+            if (ReferenceEquals(_dataSource, value)) return;
+            UnsubscribeFromDataSource();
+            _dataSource = value;
+            _cachedItems = null;
+            _cachedItemCount = null;
+            _cachedRange = null;
+            if (_dataSource is not null) SubscribeToDataSource();
+            MarkDirty();
+        }
+    }
+
+    /// <summary>Invalidate callback wired from <c>ReconcileContext</c>.</summary>
+    internal Action? InvalidateCallback { get; set; }
+
+    /// <summary>Whether the node is operating in virtualized mode.</summary>
+    public bool IsVirtualized => _dataSource is not null;
+
+    /// <summary>
+    /// The total number of items, either from the in-memory <see cref="Items"/>
+    /// list or the cached count from <see cref="DataSource"/>. Returns 0 until
+    /// the first async count completes.
+    /// </summary>
+    public int EffectiveItemCount => IsVirtualized ? (_cachedItemCount ?? 0) : Items.Count;
+
+    /// <summary>
+    /// Attempts to resolve an item by absolute index. Returns <c>false</c> for
+    /// indices not currently cached (virtualized mode only). In non-virtualized
+    /// mode this always succeeds when <paramref name="absoluteIndex"/> is in
+    /// range.
+    /// </summary>
+    public bool TryGetEffectiveItem(int absoluteIndex, out T item)
+    {
+        if (IsVirtualized)
+        {
+            if (_cachedItems is null || !_cachedRange.HasValue)
+            {
+                item = default!;
+                return false;
+            }
+            var (start, end) = _cachedRange.Value;
+            var offset = absoluteIndex - start;
+            if (offset < 0 || offset >= _cachedItems.Count || absoluteIndex >= end)
+            {
+                item = default!;
+                return false;
+            }
+            item = _cachedItems[offset];
+            return true;
+        }
+
+        if (absoluteIndex < 0 || absoluteIndex >= Items.Count)
+        {
+            item = default!;
+            return false;
+        }
+        item = Items[absoluteIndex];
+        return true;
+    }
+
+    /// <summary>
+    /// Computes the absolute range of rows to materialize for the current
+    /// scroll position: visible window plus <see cref="VirtualizationBuffer"/>
+    /// rows above and below. Used by both data-source pre-fetch and templated
+    /// child reconciliation.
+    /// </summary>
+    public (int Start, int End) GetVisibleWindow(int totalCount)
+    {
+        if (totalCount == 0) return (0, 0);
+        var visible = Math.Max(1, VisibleItemCount);
+        var start = Math.Max(0, _scrollOffset - VirtualizationBuffer);
+        var end = Math.Min(totalCount, _scrollOffset + visible + VirtualizationBuffer);
+        return (start, end);
+    }
+
+    /// <summary>
+    /// Loads <paramref name="count"/> items starting at
+    /// <paramref name="startIndex"/> from the data source, cancelling any
+    /// in-flight load. No-op when no <see cref="DataSource"/> is set.
+    /// </summary>
+    public async ValueTask LoadDataAsync(int startIndex, int count, CancellationToken cancellationToken = default)
+    {
+        if (_dataSource is null) return;
+
+        if (!_cachedItemCount.HasValue)
+        {
+            _cachedItemCount = await _dataSource.GetItemCountAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // Already covered by the existing cache.
+        if (_cachedRange is { } range && _cachedItems is not null &&
+            range.Start <= startIndex && range.End >= startIndex + count)
+        {
+            return;
+        }
+
+        if (_loadCts is not null)
+        {
+            await _loadCts.CancelAsync().ConfigureAwait(false);
+            _loadCts.Dispose();
+        }
+        _loadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var token = _loadCts.Token;
+
+        try
+        {
+            var fetched = await _dataSource.GetItemsAsync(startIndex, count, token).ConfigureAwait(false);
+            if (token.IsCancellationRequested) return;
+
+            _cachedItems = fetched;
+            _cachedRange = (startIndex, startIndex + fetched.Count);
+            MarkDirty();
+            InvalidateCallback?.Invoke();
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer load; nothing to do.
+        }
+    }
+
+    /// <summary>
+    /// Ensures the currently selected item is loaded before a selection event
+    /// fires. Called from selection/activation handlers so user code reading
+    /// <see cref="FocusedItem"/> never sees <c>default(T)</c> for an un-loaded
+    /// row. No-op in non-virtualized mode.
+    /// </summary>
+    internal async ValueTask EnsureFocusedItemLoadedAsync(CancellationToken cancellationToken = default)
+    {
+        if (!IsVirtualized) return;
+        if (TryGetEffectiveItem(_focusedIndex, out _)) return;
+
+        // Load a small window around the selection so subsequent moves are quick.
+        var window = Math.Max(1, VisibleItemCount + VirtualizationBuffer * 2);
+        var start = Math.Max(0, _focusedIndex - VirtualizationBuffer);
+        await LoadDataAsync(start, window, cancellationToken).ConfigureAwait(false);
+    }
+
+    private void SubscribeToDataSource()
+    {
+        _subscribedDataSource = _dataSource;
+        if (_subscribedDataSource is not null)
+        {
+            _subscribedDataSource.CollectionChanged += OnDataSourceCollectionChanged;
+        }
+    }
+
+    private void UnsubscribeFromDataSource()
+    {
+        if (_subscribedDataSource is not null)
+        {
+            _subscribedDataSource.CollectionChanged -= OnDataSourceCollectionChanged;
+            _subscribedDataSource = null;
+        }
+    }
+
+    private void OnDataSourceCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        _cachedItems = null;
+        _cachedItemCount = null;
+        _cachedRange = null;
+        MarkDirty();
+        InvalidateCallback?.Invoke();
+    }
+
+    #endregion
+
+    /// <summary>
+    /// Internal action invoked when the multi-select checked set changes.
+    /// Signature: (ctx, toggledIndex, isSelectedAfter, reason).
+    /// </summary>
+    internal Func<InputBindingActionContext, int, bool, ListSelectionChangeReason, Task>? SelectionChangedAction { get; set; }
+
+    private readonly HashSet<int> _selectedIndices = new();
+    private int _selectionAnchorIndex = -1;
+
+    /// <summary>
+    /// True when this list's multi-select feature is enabled. Reconciled from
+    /// <see cref="ListWidget{T}.IsMultiSelectEnabled"/>. Affects keybindings,
+    /// the default row renderer, and <see cref="ListItemContext{T}.IsSelected"/>.
+    /// </summary>
+    public bool IsMultiSelectEnabled { get; internal set; }
+
+    /// <summary>
+    /// The current checked-set indices (a read-only snapshot). Always empty
+    /// when <see cref="IsMultiSelectEnabled"/> is <c>false</c>.
+    /// </summary>
+    public IReadOnlyCollection<int> SelectedIndices => _selectedIndices;
+
+    internal IReadOnlyList<int> SelectedIndicesSnapshot
+    {
+        get
+        {
+            if (_selectedIndices.Count == 0) return Array.Empty<int>();
+            var arr = new int[_selectedIndices.Count];
+            _selectedIndices.CopyTo(arr);
+            Array.Sort(arr);
+            return arr;
+        }
+    }
+
+    internal bool IsIndexSelected(int index) => _selectedIndices.Contains(index);
+
+    internal void ApplyControlledSelectedIndices(IReadOnlyList<int> indices)
+    {
+        var count = EffectiveItemCount;
+        var before = _selectedIndices.Count;
+        _selectedIndices.Clear();
+        for (int i = 0; i < indices.Count; i++)
+        {
+            var idx = indices[i];
+            if (idx >= 0 && idx < count) _selectedIndices.Add(idx);
+        }
+        if (_selectedIndices.Count != before) MarkDirty();
+    }
+
+    internal void ClearSelectedIndicesInternal()
+    {
+        if (_selectedIndices.Count == 0 && _selectionAnchorIndex < 0) return;
+        _selectedIndices.Clear();
+        _selectionAnchorIndex = -1;
+        MarkDirty();
+    }
+
+    /// <summary>
+    /// Returns a materialised list of items at the given selected indices,
+    /// skipping any indices whose data has not yet been loaded by a
+    /// virtualized data source.
+    /// </summary>
+    internal IReadOnlyList<T> MaterializeSelectedItems(IReadOnlyList<int> indices)
+    {
+        if (indices.Count == 0) return Array.Empty<T>();
+        var list = new List<T>(indices.Count);
+        for (int i = 0; i < indices.Count; i++)
+        {
+            if (TryGetEffectiveItem(indices[i], out var item)) list.Add(item);
+        }
+        return list;
+    }
 
     /// <summary>
     /// Internal action invoked when selection changes.
     /// </summary>
-    internal Func<InputBindingActionContext, Task>? SelectionChangedAction { get; set; }
+    internal Func<InputBindingActionContext, Task>? FocusChangedAction { get; set; }
 
     /// <summary>
     /// Internal action invoked when an item is activated.
     /// </summary>
     internal Func<InputBindingActionContext, Task>? ItemActivatedAction { get; set; }
-    
+
     private bool _isFocused;
-    public override bool IsFocused 
-    { 
-        get => _isFocused; 
-        set 
+    public override bool IsFocused
+    {
+        get => _isFocused;
+        set
         {
             if (_isFocused != value)
             {
@@ -129,14 +541,19 @@ public sealed class ListNode : Hex1bNode
     }
 
     private bool _isHovered;
-    public override bool IsHovered 
-    { 
-        get => _isHovered; 
-        set 
+    public override bool IsHovered
+    {
+        get => _isHovered;
+        set
         {
             if (_isHovered != value)
             {
                 _isHovered = value;
+                if (!value)
+                {
+                    // Mouse left the list — clear the per-row hover too.
+                    HoveredItemIndex = -1;
+                }
                 MarkDirty();
             }
         }
@@ -144,43 +561,134 @@ public sealed class ListNode : Hex1bNode
 
     public override bool IsFocusable => true;
 
+    public override void OnHoverMove(int mouseX, int mouseY)
+    {
+        var count = EffectiveItemCount;
+        if (count == 0 || _itemHeight <= 0)
+        {
+            HoveredItemIndex = -1;
+            return;
+        }
+
+        var localY = mouseY - Bounds.Y;
+        if (localY < 0 || localY >= _viewportHeight)
+        {
+            HoveredItemIndex = -1;
+            return;
+        }
+
+        var idx = (localY / _itemHeight) + _scrollOffset;
+        HoveredItemIndex = idx >= 0 && idx < count ? idx : -1;
+    }
+
+    #region ILayoutProvider
+
+    public Rect ClipRect => Bounds;
+    public ClipMode ClipMode => ClipMode.Clip;
+    public ILayoutProvider? ParentLayoutProvider { get; set; }
+
+    public bool ShouldRenderAt(int x, int y) => LayoutProviderHelper.ShouldRenderAt(this, x, y);
+
+    public (int adjustedX, string clippedText) ClipString(int x, int y, string text)
+        => LayoutProviderHelper.ClipString(this, x, y, text);
+
+    #endregion
+
+    /// <summary>
+    /// Default binding configuration uses <see cref="ListWidget{T}"/>'s
+    /// rebindable actions. The <see cref="ListNode"/> override redirects to the
+    /// legacy <see cref="ListWidget"/> action ids so existing rebind code keeps
+    /// working.
+    /// </summary>
     public override void ConfigureDefaultBindings(InputBindingsBuilder bindings)
     {
-        // Navigation with selection changed events
-        bindings.Key(Hex1bKey.UpArrow).Triggers(ListWidget.MoveUp, MoveUpWithEvent, "Move up");
-        bindings.Key(Hex1bKey.DownArrow).Triggers(ListWidget.MoveDown, MoveDownWithEvent, "Move down");
-        
-        // Activation - always bind Enter/Space so focused lists consume these keys
-        bindings.Key(Hex1bKey.Enter).Triggers(ListWidget.Activate, ActivateItemWithEvent, "Activate item");
-        bindings.Key(Hex1bKey.Spacebar).Triggers(ListWidget.Activate, ActivateItemWithEvent, "Activate item");
-        
-        // Mouse click to select and activate
-        bindings.Mouse(MouseButton.Left).Triggers(ListWidget.Activate, MouseSelectAndActivate, "Select and activate item");
-        
-        // Mouse wheel scrolling - navigates selection like arrow keys (ignores cursor position)
-        bindings.Mouse(MouseButton.ScrollUp).Triggers(ListWidget.ScrollUp, MoveUpWithEvent, "Scroll up");
-        bindings.Mouse(MouseButton.ScrollDown).Triggers(ListWidget.ScrollDown, MoveDownWithEvent, "Scroll down");
+        ConfigureDefaultBindings(
+            bindings,
+            ListWidget<T>.MoveUp,
+            ListWidget<T>.MoveDown,
+            ListWidget<T>.Activate,
+            ListWidget<T>.ScrollUp,
+            ListWidget<T>.ScrollDown,
+            ListWidget<T>.MoveToFirst,
+            ListWidget<T>.MoveToLast,
+            ListWidget<T>.PageUp,
+            ListWidget<T>.PageDown,
+            ListWidget<T>.ToggleSelection,
+            ListWidget<T>.ExtendSelectionUp,
+            ListWidget<T>.ExtendSelectionDown,
+            ListWidget<T>.ExtendSelectionToFirst,
+            ListWidget<T>.ExtendSelectionToLast,
+            ListWidget<T>.SelectAll);
+    }
+
+    internal void ConfigureDefaultBindings(
+        InputBindingsBuilder bindings,
+        ActionId moveUp,
+        ActionId moveDown,
+        ActionId activate,
+        ActionId scrollUp,
+        ActionId scrollDown,
+        ActionId moveToFirst,
+        ActionId moveToLast,
+        ActionId pageUp,
+        ActionId pageDown,
+        ActionId toggleSelection = default,
+        ActionId extendSelectionUp = default,
+        ActionId extendSelectionDown = default,
+        ActionId extendSelectionToFirst = default,
+        ActionId extendSelectionToLast = default,
+        ActionId selectAll = default)
+    {
+        bindings.Key(Hex1bKey.UpArrow).Triggers(moveUp, MoveUpWithEvent, "Move up");
+        bindings.Key(Hex1bKey.DownArrow).Triggers(moveDown, MoveDownWithEvent, "Move down");
+
+        bindings.Key(Hex1bKey.Home).Triggers(moveToFirst, MoveToFirstWithEvent, "First item");
+        bindings.Key(Hex1bKey.End).Triggers(moveToLast, MoveToLastWithEvent, "Last item");
+        bindings.Key(Hex1bKey.PageUp).Triggers(pageUp, PageUpWithEvent, "Page up");
+        bindings.Key(Hex1bKey.PageDown).Triggers(pageDown, PageDownWithEvent, "Page down");
+
+        bindings.Key(Hex1bKey.Enter).Triggers(activate, ActivateItemWithEvent, "Activate item");
+
+        // Spacebar binding is mode-dependent. In single-select mode it
+        // activates (mirroring Enter); in multi-select mode it toggles the
+        // focused row's checked state.
+        if (IsMultiSelectEnabled)
+        {
+            bindings.Key(Hex1bKey.Spacebar).Triggers(toggleSelection, ToggleSelectionWithEvent, "Toggle selection");
+            bindings.Shift().Key(Hex1bKey.UpArrow).Triggers(extendSelectionUp, ExtendSelectionUpWithEvent, "Extend selection up");
+            bindings.Shift().Key(Hex1bKey.DownArrow).Triggers(extendSelectionDown, ExtendSelectionDownWithEvent, "Extend selection down");
+            bindings.Shift().Key(Hex1bKey.Home).Triggers(extendSelectionToFirst, ExtendSelectionToFirstWithEvent, "Select to first");
+            bindings.Shift().Key(Hex1bKey.End).Triggers(extendSelectionToLast, ExtendSelectionToLastWithEvent, "Select to last");
+            bindings.Ctrl().Key(Hex1bKey.A).Triggers(selectAll, SelectAllWithEvent, "Select all");
+        }
+        else
+        {
+            bindings.Key(Hex1bKey.Spacebar).Triggers(activate, ActivateItemWithEvent, "Activate item");
+        }
+
+        bindings.Mouse(MouseButton.Left).Triggers(activate, MouseSelectAndActivate, "Select and activate item");
+
+        bindings.Mouse(MouseButton.ScrollUp).Triggers(scrollUp, MoveUpWithEvent, "Scroll up");
+        bindings.Mouse(MouseButton.ScrollDown).Triggers(scrollDown, MoveDownWithEvent, "Scroll down");
     }
 
     private async Task MouseSelectAndActivate(InputBindingActionContext ctx)
     {
-        // The mouse position is available in the context, calculate local Y to determine which item was clicked
         var localY = ctx.MouseY - Bounds.Y;
-        
-        // Convert local Y to item index (accounting for scroll offset)
-        var itemIndex = localY + _scrollOffset;
-        
-        if (itemIndex >= 0 && itemIndex < Items.Count)
+        var itemIndex = (localY / Math.Max(1, _itemHeight)) + _scrollOffset;
+
+        if (itemIndex >= 0 && itemIndex < EffectiveItemCount)
         {
-            var previousIndex = SelectedIndex;
+            var previousIndex = FocusedIndex;
             SetSelection(itemIndex);
-            
-            // Fire selection changed if the selection actually changed
-            if (previousIndex != SelectedIndex && SelectionChangedAction != null)
+
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+
+            if (previousIndex != FocusedIndex && FocusChangedAction != null)
             {
-                await SelectionChangedAction(ctx);
+                await FocusChangedAction(ctx);
             }
-            
+
             if (ItemActivatedAction != null)
             {
                 await ItemActivatedAction(ctx);
@@ -192,6 +700,7 @@ public sealed class ListNode : Hex1bNode
     {
         if (ItemActivatedAction != null)
         {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
             await ItemActivatedAction(ctx);
         }
     }
@@ -199,79 +708,300 @@ public sealed class ListNode : Hex1bNode
     private async Task MoveUpWithEvent(InputBindingActionContext ctx)
     {
         MoveUp();
-        if (SelectionChangedAction != null)
+        if (FocusChangedAction != null)
         {
-            await SelectionChangedAction(ctx);
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
         }
     }
 
     private async Task MoveDownWithEvent(InputBindingActionContext ctx)
     {
         MoveDown();
-        if (SelectionChangedAction != null)
+        if (FocusChangedAction != null)
         {
-            await SelectionChangedAction(ctx);
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
         }
     }
 
-    /// <summary>
-    /// Moves selection up (with wrap-around).
-    /// </summary>
     internal void MoveUp()
     {
-        if (Items.Count == 0) return;
-        SelectedIndex = SelectedIndex <= 0 ? Items.Count - 1 : SelectedIndex - 1;
+        var count = EffectiveItemCount;
+        if (count == 0) return;
+        FocusedIndex = FocusedIndex <= 0 ? count - 1 : FocusedIndex - 1;
     }
 
-    /// <summary>
-    /// Moves selection down (with wrap-around).
-    /// </summary>
     internal void MoveDown()
     {
-        if (Items.Count == 0) return;
-        SelectedIndex = (SelectedIndex + 1) % Items.Count;
+        var count = EffectiveItemCount;
+        if (count == 0) return;
+        FocusedIndex = (FocusedIndex + 1) % count;
     }
 
-    /// <summary>
-    /// Sets the selection to a specific index.
-    /// </summary>
+    internal void MoveToFirst()
+    {
+        if (EffectiveItemCount == 0) return;
+        FocusedIndex = 0;
+    }
+
+    internal void MoveToLast()
+    {
+        var count = EffectiveItemCount;
+        if (count == 0) return;
+        FocusedIndex = count - 1;
+    }
+
+    internal void PageUp()
+    {
+        var count = EffectiveItemCount;
+        if (count == 0) return;
+        var step = Math.Max(1, VisibleItemCount);
+        FocusedIndex = Math.Max(0, FocusedIndex - step);
+    }
+
+    internal void PageDown()
+    {
+        var count = EffectiveItemCount;
+        if (count == 0) return;
+        var step = Math.Max(1, VisibleItemCount);
+        FocusedIndex = Math.Min(count - 1, FocusedIndex + step);
+    }
+
+    private async Task MoveToFirstWithEvent(InputBindingActionContext ctx)
+    {
+        var previous = FocusedIndex;
+        MoveToFirst();
+        if (previous != FocusedIndex && FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+    }
+
+    private async Task MoveToLastWithEvent(InputBindingActionContext ctx)
+    {
+        var previous = FocusedIndex;
+        MoveToLast();
+        if (previous != FocusedIndex && FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+    }
+
+    private async Task PageUpWithEvent(InputBindingActionContext ctx)
+    {
+        var previous = FocusedIndex;
+        PageUp();
+        if (previous != FocusedIndex && FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+    }
+
+    private async Task PageDownWithEvent(InputBindingActionContext ctx)
+    {
+        var previous = FocusedIndex;
+        PageDown();
+        if (previous != FocusedIndex && FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+    }
+
     internal void SetSelection(int index)
     {
-        if (Items.Count == 0 || index < 0 || index >= Items.Count) return;
-        SelectedIndex = index;
+        var count = EffectiveItemCount;
+        if (count == 0 || index < 0 || index >= count) return;
+        FocusedIndex = index;
+    }
+
+    // -------------------- Multi-select actions --------------------
+
+    /// <summary>
+    /// Toggle a specific index's membership in the checked set and set the
+    /// range-extension anchor to that index. Returns the new membership state.
+    /// </summary>
+    internal bool ToggleSelectionAt(int index)
+    {
+        if (index < 0 || index >= EffectiveItemCount) return false;
+        bool nowSelected;
+        if (_selectedIndices.Contains(index))
+        {
+            _selectedIndices.Remove(index);
+            nowSelected = false;
+        }
+        else
+        {
+            _selectedIndices.Add(index);
+            nowSelected = true;
+        }
+        _selectionAnchorIndex = index;
+        MarkDirty();
+        return nowSelected;
+    }
+
+    private void EnsureAnchor()
+    {
+        if (_selectionAnchorIndex < 0 || _selectionAnchorIndex >= EffectiveItemCount)
+        {
+            _selectionAnchorIndex = FocusedIndex >= 0 ? FocusedIndex : 0;
+        }
     }
 
     /// <summary>
-    /// Ensures the currently selected item is visible in the viewport.
-    /// Scrolls the viewport if necessary.
+    /// Select the inclusive range between <see cref="_selectionAnchorIndex"/>
+    /// and <paramref name="toIndex"/>; rows outside the range retain their
+    /// prior membership.
     /// </summary>
-    private void EnsureSelectionVisible()
+    internal void ExtendSelectionTo(int toIndex)
     {
-        if (_viewportHeight <= 0 || Items.Count == 0) return;
+        var count = EffectiveItemCount;
+        if (count == 0) return;
+        EnsureAnchor();
+        toIndex = Math.Clamp(toIndex, 0, count - 1);
+        var lo = Math.Min(_selectionAnchorIndex, toIndex);
+        var hi = Math.Max(_selectionAnchorIndex, toIndex);
+        for (int i = lo; i <= hi; i++) _selectedIndices.Add(i);
+        MarkDirty();
+    }
 
-        // If selection is above the viewport, scroll up
-        if (SelectedIndex < _scrollOffset)
+    /// <summary>
+    /// Toggle "select all": if every row is already selected, clear the set;
+    /// otherwise add every row. Returns <c>true</c> when the result is "all
+    /// selected".
+    /// </summary>
+    internal bool ToggleSelectAll()
+    {
+        var count = EffectiveItemCount;
+        if (count == 0) return false;
+        if (_selectedIndices.Count == count)
         {
-            _scrollOffset = SelectedIndex;
+            _selectedIndices.Clear();
+            MarkDirty();
+            return false;
         }
-        // If selection is below the viewport, scroll down
-        else if (SelectedIndex >= _scrollOffset + _viewportHeight)
+        for (int i = 0; i < count; i++) _selectedIndices.Add(i);
+        MarkDirty();
+        return true;
+    }
+
+    private async Task ToggleSelectionWithEvent(InputBindingActionContext ctx)
+    {
+        if (!IsMultiSelectEnabled) return;
+        var idx = FocusedIndex;
+        if (idx < 0 || idx >= EffectiveItemCount) return;
+        var nowSelected = ToggleSelectionAt(idx);
+        if (SelectionChangedAction != null)
         {
-            _scrollOffset = SelectedIndex - _viewportHeight + 1;
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await SelectionChangedAction(ctx, idx, nowSelected, ListSelectionChangeReason.Toggle);
         }
-        
-        // Clamp scroll offset to valid range
+    }
+
+    private async Task ExtendSelectionUpWithEvent(InputBindingActionContext ctx)
+    {
+        if (!IsMultiSelectEnabled) return;
+        MoveUp();
+        ExtendSelectionTo(FocusedIndex);
+        if (FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+        if (SelectionChangedAction != null)
+        {
+            await SelectionChangedAction(ctx, FocusedIndex, true, ListSelectionChangeReason.ExtendRange);
+        }
+    }
+
+    private async Task ExtendSelectionDownWithEvent(InputBindingActionContext ctx)
+    {
+        if (!IsMultiSelectEnabled) return;
+        MoveDown();
+        ExtendSelectionTo(FocusedIndex);
+        if (FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+        if (SelectionChangedAction != null)
+        {
+            await SelectionChangedAction(ctx, FocusedIndex, true, ListSelectionChangeReason.ExtendRange);
+        }
+    }
+
+    private async Task ExtendSelectionToFirstWithEvent(InputBindingActionContext ctx)
+    {
+        if (!IsMultiSelectEnabled) return;
+        MoveToFirst();
+        ExtendSelectionTo(FocusedIndex);
+        if (FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+        if (SelectionChangedAction != null)
+        {
+            await SelectionChangedAction(ctx, FocusedIndex, true, ListSelectionChangeReason.ExtendRange);
+        }
+    }
+
+    private async Task ExtendSelectionToLastWithEvent(InputBindingActionContext ctx)
+    {
+        if (!IsMultiSelectEnabled) return;
+        MoveToLast();
+        ExtendSelectionTo(FocusedIndex);
+        if (FocusChangedAction != null)
+        {
+            await EnsureFocusedItemLoadedAsync(ctx.CancellationToken).ConfigureAwait(false);
+            await FocusChangedAction(ctx);
+        }
+        if (SelectionChangedAction != null)
+        {
+            await SelectionChangedAction(ctx, FocusedIndex, true, ListSelectionChangeReason.ExtendRange);
+        }
+    }
+
+    private async Task SelectAllWithEvent(InputBindingActionContext ctx)
+    {
+        if (!IsMultiSelectEnabled) return;
+        var nowAllSelected = ToggleSelectAll();
+        if (SelectionChangedAction != null)
+        {
+            await SelectionChangedAction(
+                ctx,
+                -1,
+                nowAllSelected,
+                nowAllSelected ? ListSelectionChangeReason.SelectAll : ListSelectionChangeReason.DeselectAll);
+        }
+    }
+
+    private void EnsureFocusVisible()
+    {
+        var visible = VisibleItemCount;
+        var count = EffectiveItemCount;
+        if (visible <= 0 || count == 0) return;
+
+        if (FocusedIndex < _scrollOffset)
+        {
+            _scrollOffset = FocusedIndex;
+        }
+        else if (FocusedIndex >= _scrollOffset + visible)
+        {
+            _scrollOffset = FocusedIndex - visible + 1;
+        }
+
         _scrollOffset = Math.Clamp(_scrollOffset, 0, MaxScrollOffset);
     }
 
-    /// <summary>
-    /// Handles mouse click by selecting the item at the clicked row.
-    /// </summary>
     public override InputResult HandleMouseClick(int localX, int localY, Hex1bMouseEvent mouseEvent)
     {
-        // Convert local Y to item index (accounting for scroll offset)
-        var itemIndex = localY + _scrollOffset;
-        if (itemIndex >= 0 && itemIndex < Items.Count)
+        var itemIndex = (localY / Math.Max(1, _itemHeight)) + _scrollOffset;
+        if (itemIndex >= 0 && itemIndex < EffectiveItemCount)
         {
             SetSelection(itemIndex);
             return InputResult.Handled;
@@ -281,36 +1011,151 @@ public sealed class ListNode : Hex1bNode
 
     protected override Size MeasureCore(Constraints constraints)
     {
-        // List: width is max item length + indicator (2 chars), height is item count
-        var maxWidth = 0;
-        foreach (var item in Items)
+        int maxWidth;
+        var count = EffectiveItemCount;
+
+        if (IsVirtualized)
         {
-            maxWidth = Math.Max(maxWidth, item.Length + 2); // "> " indicator
+            // Cannot walk the whole virtual collection. Measure from cached
+            // items only — the visible window is always materialised so this
+            // produces a stable width for what's currently on screen.
+            maxWidth = 0;
+            if (_cachedItems is not null && _cachedRange is { } range)
+            {
+                for (int i = 0; i < _cachedItems.Count; i++)
+                {
+                    var len = (_cachedItems[i]?.ToString()?.Length ?? 0) + 2;
+                    if (len > maxWidth) maxWidth = len;
+                }
+            }
+            if (maxWidth == 0) maxWidth = constraints.MinWidth;
         }
-        var height = Math.Max(Items.Count, 1);
+        else
+        {
+            // Width: longest item label + indicator (default path) OR template's natural width.
+            maxWidth = 0;
+            for (int i = 0; i < Items.Count; i++)
+            {
+                var len = (Items[i]?.ToString()?.Length ?? 0) + 2; // "> " indicator
+                if (len > maxWidth) maxWidth = len;
+            }
+        }
+
+        var height = Math.Max(count * Math.Max(1, _itemHeight), 1);
         var constrainedSize = constraints.Constrain(new Size(maxWidth, height));
-        
-        // Store the viewport height from constraints (may be less than item count)
         _viewportHeight = constrainedSize.Height;
-        
         return constrainedSize;
     }
 
     protected override void ArrangeCore(Rect bounds)
     {
         base.ArrangeCore(bounds);
-        
-        // Update viewport height based on actual arranged bounds
+
         _viewportHeight = bounds.Height;
-        
-        // Clamp scroll offset to valid range after viewport size change
         _scrollOffset = Math.Clamp(_scrollOffset, 0, MaxScrollOffset);
-        
-        // Ensure selection is still visible after arrange
-        EnsureSelectionVisible();
+        EnsureFocusVisible();
+
+        // Arrange the empty-state child (if any) to fill the list bounds.
+        if (EmptyChildNode is { } emptyChild && ShouldShowEmptyState)
+        {
+            emptyChild.Measure(new Constraints(0, bounds.Width, 0, bounds.Height));
+            emptyChild.Arrange(bounds);
+        }
+        else if (EmptyChildNode is { } parkedEmpty)
+        {
+            // Park offscreen so it doesn't intercept layout/hit-tests while items are present.
+            parkedEmpty.Arrange(new Rect(bounds.X, bounds.Y, 0, 0));
+        }
+
+        // Arrange visible item nodes into their row sub-rects.
+        if (ItemNodes.Count > 0)
+        {
+            var visible = VisibleItemCount;
+            var rowHeight = Math.Max(1, _itemHeight);
+            for (int i = 0; i < ItemNodes.Count; i++)
+            {
+                var absoluteIndex = ItemNodesWindowStart + i;
+                if (absoluteIndex < _scrollOffset || absoluteIndex >= _scrollOffset + visible)
+                {
+                    // Park offscreen children at a degenerate rect so they don't
+                    // intercept hit tests but still get their bounds updated.
+                    ItemNodes[i].Arrange(new Rect(bounds.X, bounds.Y, 0, 0));
+                    continue;
+                }
+
+                var rowY = bounds.Y + (absoluteIndex - _scrollOffset) * rowHeight;
+                var rowRect = new Rect(bounds.X, rowY, bounds.Width, rowHeight);
+                ItemNodes[i].Measure(new Constraints(0, bounds.Width, 0, rowHeight));
+                ItemNodes[i].Arrange(rowRect);
+            }
+        }
+    }
+
+    public override IEnumerable<Hex1bNode> GetChildren()
+    {
+        foreach (var item in ItemNodes) yield return item;
+        if (EmptyChildNode is { } empty) yield return empty;
+    }
+
+    /// <summary>
+    /// Item child nodes are render-only in v1 — the list itself is the only
+    /// focusable surface. Interactive widgets inside an item template will not
+    /// receive focus.
+    /// </summary>
+    public override IEnumerable<Hex1bNode> GetFocusableNodes()
+    {
+        if (IsFocusable) yield return this;
     }
 
     public override void Render(Hex1bRenderContext context)
+    {
+        var previousLayout = context.CurrentLayoutProvider;
+        ParentLayoutProvider = previousLayout;
+        context.CurrentLayoutProvider = this;
+
+        if (EmptyChildNode is { } emptyChild && ShouldShowEmptyState)
+        {
+            context.RenderChild(emptyChild);
+        }
+        else if (ItemTemplate != null && ItemNodes.Count > 0)
+        {
+            RenderTemplated(context);
+        }
+        else
+        {
+            ListRenderCore.RenderDefault(this, context);
+        }
+
+        context.CurrentLayoutProvider = previousLayout;
+        ParentLayoutProvider = null;
+    }
+
+    private void RenderTemplated(Hex1bRenderContext context)
+    {
+        var visibleStart = _scrollOffset;
+        var visibleEnd = Math.Min(_scrollOffset + VisibleItemCount, EffectiveItemCount);
+
+        for (int i = visibleStart; i < visibleEnd; i++)
+        {
+            if (TryGetItemNode(i, out var child))
+            {
+                context.RenderChild(child);
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Shared default (no-template) renderer for both <see cref="ListNode"/> and
+/// templateless <see cref="ListNode{T}"/>. Keeps the visual contract of the
+/// original list — themed selection indicator, selected background, hover
+/// background — in one place.
+/// </summary>
+internal static class ListRenderCore
+{
+    private const string LoadingPlaceholder = "…";
+
+    public static void RenderDefault<T>(ListNode<T> node, Hex1bRenderContext context)
     {
         var theme = context.Theme;
         var selectedIndicator = theme.Get(ListTheme.SelectedIndicator);
@@ -319,59 +1164,54 @@ public sealed class ListNode : Hex1bNode
         var selectedBg = theme.Get(ListTheme.SelectedBackgroundColor);
         var hoveredFg = theme.Get(ListTheme.HoveredForegroundColor);
         var hoveredBg = theme.Get(ListTheme.HoveredBackgroundColor);
-        
-        // Get global colors for non-selected items
+
         var globalColors = theme.GetGlobalColorCodes();
         var resetToGlobal = theme.GetResetToGlobalCodes();
-        
-        // Calculate which item is hovered (if any)
-        var hoveredItemIndex = -1;
-        if (IsHovered && context.MouseY >= Bounds.Y && context.MouseY < Bounds.Y + _viewportHeight)
-        {
-            var localY = context.MouseY - Bounds.Y;
-            hoveredItemIndex = localY + _scrollOffset;
-            if (hoveredItemIndex >= Items.Count)
-            {
-                hoveredItemIndex = -1;
-            }
-        }
-        
-        // Calculate which items are visible in the viewport
-        var visibleStart = _scrollOffset;
-        var visibleEnd = Math.Min(_scrollOffset + _viewportHeight, Items.Count);
-        
+
+        var hoveredItemIndex = node.IsHovered ? node.HoveredItemIndex : -1;
+
+        var visibleStart = node.ScrollOffset;
+        var visibleEnd = Math.Min(node.ScrollOffset + node.VisibleItemCount, node.EffectiveItemCount);
+
+        // Multi-select glyph prefix (rendered between the cursor arrow and the
+        // item text). Empty string when multi-select is off so the layout
+        // remains unchanged for the common single-select case.
+        var multiSelect = node.IsMultiSelectEnabled;
+        var checkedGlyph = multiSelect ? theme.Get(ListTheme.CheckboxChecked) : string.Empty;
+        var uncheckedGlyph = multiSelect ? theme.Get(ListTheme.CheckboxUnchecked) : string.Empty;
+
         for (int i = visibleStart; i < visibleEnd; i++)
         {
-            var item = Items[i];
-            var isSelected = i == SelectedIndex;
+            var item = node.TryGetEffectiveItem(i, out var value)
+                ? value?.ToString() ?? string.Empty
+                : LoadingPlaceholder;
+            var isSelected = i == node.FocusedIndex;
             var isHoveredItem = i == hoveredItemIndex;
+            var checkbox = multiSelect
+                ? (node.IsIndexSelected(i) ? checkedGlyph : uncheckedGlyph)
+                : string.Empty;
 
-            var x = Bounds.X;
-            var y = Bounds.Y + (i - _scrollOffset);  // Adjust y position for scroll offset
-            
+            var x = node.Bounds.X;
+            var y = node.Bounds.Y + (i - node.ScrollOffset);
+
             string text;
-            if (isSelected && IsFocused)
+            if (isSelected && node.IsFocused)
             {
-                // Focused and selected: use theme colors
-                text = $"{selectedFg.ToForegroundAnsi()}{selectedBg.ToBackgroundAnsi()}{selectedIndicator}{item}{resetToGlobal}";
+                text = $"{selectedFg.ToForegroundAnsi()}{selectedBg.ToBackgroundAnsi()}{selectedIndicator}{checkbox}{item}{resetToGlobal}";
             }
             else if (isHoveredItem && !isSelected)
             {
-                // Hovered but not selected: use hover colors
-                text = $"{hoveredFg.ToForegroundAnsi()}{hoveredBg.ToBackgroundAnsi()}{unselectedIndicator}{item}{resetToGlobal}";
+                text = $"{hoveredFg.ToForegroundAnsi()}{hoveredBg.ToBackgroundAnsi()}{unselectedIndicator}{checkbox}{item}{resetToGlobal}";
             }
             else if (isSelected)
             {
-                // Selected but not focused: just show indicator with global colors
-                text = $"{globalColors}{selectedIndicator}{item}{resetToGlobal}";
+                text = $"{globalColors}{selectedIndicator}{checkbox}{item}{resetToGlobal}";
             }
             else
             {
-                // Not selected: use global colors
-                text = $"{globalColors}{unselectedIndicator}{item}{resetToGlobal}";
+                text = $"{globalColors}{unselectedIndicator}{checkbox}{item}{resetToGlobal}";
             }
 
-            // Use clipped rendering when a layout provider is active
             if (context.CurrentLayoutProvider != null)
             {
                 context.WriteClipped(x, y, text);
@@ -382,5 +1222,31 @@ public sealed class ListNode : Hex1bNode
                 context.Write(text);
             }
         }
+    }
+}
+
+/// <summary>
+/// String-specialized list node. Inherits all selection/scrolling/template
+/// behavior from <see cref="ListNode{T}"/> with <c>T = string</c>; exists
+/// as a distinct concrete type so legacy <see cref="ListWidget"/> handlers and
+/// tests that reference <c>ListNode</c> continue to compile and run unchanged.
+/// </summary>
+public sealed class ListNode : ListNode<string>
+{
+    public override void ConfigureDefaultBindings(InputBindingsBuilder bindings)
+    {
+        // Redirect default bindings to the legacy ListWidget action ids so existing
+        // rebind code (b.Remove(ListWidget.MoveUp), etc.) keeps working.
+        ConfigureDefaultBindings(
+            bindings,
+            ListWidget.MoveUp,
+            ListWidget.MoveDown,
+            ListWidget.Activate,
+            ListWidget.ScrollUp,
+            ListWidget.ScrollDown,
+            ListWidget.MoveToFirst,
+            ListWidget.MoveToLast,
+            ListWidget.PageUp,
+            ListWidget.PageDown);
     }
 }
